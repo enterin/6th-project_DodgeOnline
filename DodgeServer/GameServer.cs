@@ -74,8 +74,15 @@ namespace DodgeServer
         const int SnapshotHz = 20;
         const int SpawnMs = 750;
 
+        const int PlayerW = 40;
+        const int PlayerH = 40;
+
         // GameServer 클래스 필드 영역
+        enum Phase { Countdown, Playing, AwaitingRestart }  // ★ Countdown 추가
         int _round = 1;   // 현재 라운드(시작을 1로 가정)
+        const int CountdownMs = 3000; // 3초
+        int _countdownMsLeft = 0;     // 남은 ms
+        
 
         // ===== 월드 크기 (클라와 합의) =====
         readonly int _worldW = 900;
@@ -110,6 +117,7 @@ namespace DodgeServer
 
         public void Start()
         {
+            _phase = Phase.Countdown; _countdownMsLeft = CountdownMs;
             _rng = new Random(_seed);
             _listener = new TcpListener(IPAddress.Parse(_host), _port);
             _listener.Start();
@@ -268,6 +276,18 @@ namespace DodgeServer
 
             lock (_lock)
             {
+                if (_phase == Phase.Countdown)
+                {
+                    _countdownMsLeft -= (int)(dt * 1000f);
+                    if (_countdownMsLeft <= 0)
+                    {
+                        _countdownMsLeft = 0;
+                        _phase = Phase.Playing;        // ★ 카운트다운 끝 → 플레이 시작
+                        Console.WriteLine("[ROUND] Round " + _round + " START");
+                    }
+                    return; // ★ 카운트다운 중엔 물리/스폰/충돌 업데이트 정지
+                }
+
                 if (_phase == Phase.Playing)
                 {
                     // 스폰
@@ -295,15 +315,25 @@ namespace DodgeServer
 
                         ApplyBounds(p);
 
-                        Rectangle pr = Rectangle.Round(new RectangleF(p.X, p.Y, 40, 40));
+                        // === 여기부터 충돌 판정 변경 ===
+                        // 1) 플레이어 히트박스(원한다면 살짝 축소: 80%)
+                        var pRectRaw = new RectangleF(p.X, p.Y, PlayerW, PlayerH);
+                        var pHit = Rectangle.Round(DeflateAroundCenter(pRectRaw, 0.7f, 0.8f));  // 취향대로
+
+                        // 2) 장애물 히트박스 축소
                         for (int i = 0; i < _obstacles.Count; i++)
                         {
-                            if (pr.IntersectsWith(Rectangle.Round(_obstacles[i])))
+                            // _obstacles는 SpawnObstacle에서 RectangleF(x, y, ObstacleW, ObstacleH)로 넣으므로 곧바로 사용 가능
+                            var obRect = _obstacles[i];
+                            var obHit = Rectangle.Round(DeflateAroundCenter(obRect, 0.7f, 0.7f));
+
+                            if (pHit.IntersectsWith(obHit))
                             {
                                 p.Alive = false;
                                 break;
                             }
                         }
+                        // === 충돌 판정 변경 끝 ===
                     }
 
                     // 장애물 하강/소거 + 점수
@@ -375,6 +405,20 @@ namespace DodgeServer
             }
         }
 
+        // 가운데를 기준으로 가로/세로 비율만큼 축소된 사각형 반환
+        static RectangleF DeflateAroundCenter(RectangleF r, float scaleX, float scaleY)
+        {
+            // 0~1 범위로 제한
+            if (scaleX < 0f) scaleX = 0f; if (scaleX > 1f) scaleX = 1f;
+            if (scaleY < 0f) scaleY = 0f; if (scaleY > 1f) scaleY = 1f;
+
+            float newW = r.Width * scaleX;
+            float newH = r.Height * scaleY;
+            float cx = r.X + r.Width / 2f;
+            float cy = r.Y + r.Height / 2f;
+            return new RectangleF(cx - newW / 2f, cy - newH / 2f, newW, newH);
+        }
+
         static string Escape(string s)
         {
             if (string.IsNullOrEmpty(s)) return "";
@@ -409,7 +453,8 @@ namespace DodgeServer
         void RestartRound_Locked()
         {
             _respawnVotes.Clear();
-            _phase = Phase.Playing;
+            _phase = Phase.Countdown;          // ★ 카운트다운 시작
+            _countdownMsLeft = CountdownMs;    // ★ 3초 세팅
 
             _obstacles.Clear();
             _spawnAccumMs = 0;
@@ -430,7 +475,7 @@ namespace DodgeServer
                 p.X = startX;
                 p.Y = groundY;
 
-                // 라운드마다 초기화 원하면 주석 해제:
+                // 라운드마다 초기화
                 p.Score = 0;
             }
 
@@ -445,6 +490,7 @@ namespace DodgeServer
             sb.Append("{\"cmd\":\"SNAPSHOT\",\"tick\":").Append(_tick).Append(",")
               .Append("\"round\":").Append(_round).Append(",")
               .Append("\"phase\":\"").Append(_phase == Phase.Playing ? "playing" : "await").Append("\",")
+              .Append("\"countdown_ms\":").Append(_countdownMsLeft).Append(",")
               .Append("\"vote_count\":").Append(_respawnVotes.Count).Append(",")
               .Append("\"need_count\":").Append(_players.Count).Append(",");
 

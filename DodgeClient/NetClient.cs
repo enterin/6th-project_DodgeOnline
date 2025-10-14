@@ -19,8 +19,9 @@ namespace DodgeBattleStarter
     public class NetSnapshot
     {
         public int Tick;
-        public int Round = 1;           // ★ 라운드
-        public string Phase = "playing";
+        public int Round = 1;
+        public string Phase = "playing"; // "playing" / "await" / "countdown"
+        public int CountdownMs = 0;      // ★ 남은 ms
         public int VoteCount = 0;
         public int NeedCount = 0;
         public List<NetPlayer> Players = new List<NetPlayer>();
@@ -164,6 +165,7 @@ namespace DodgeBattleStarter
             snap.Round = ExtractInt(json, "round");
             string phase = ExtractString(json, "phase");
             if (!string.IsNullOrEmpty(phase)) snap.Phase = phase;
+            snap.CountdownMs = ExtractInt(json, "countdown_ms");
             snap.VoteCount = ExtractInt(json, "vote_count");
             snap.NeedCount = ExtractInt(json, "need_count");
 

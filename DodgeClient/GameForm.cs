@@ -20,6 +20,19 @@ namespace DodgeBattleStarter
         const int SpawnMs = 750;
         readonly SizeF PlayerSize = new SizeF(40, 40);
 
+        // 스프라이트(방향별)
+        Image _imgPlayerRightRaw, _imgPlayerLeftRaw;
+        Image _imgPlayerRight, _imgPlayerLeft;
+        //장애물 스프라이트
+        Image _imgFire_SwordRaw, _imgFire_Sword;
+
+        // 로컬 플레이어 바라보는 방향 (기본: 오른쪽)
+        bool _facingRight = true;
+
+        // 온라인에서 다른 플레이어의 바라보는 방향 추정
+        Dictionary<string, bool> _facingRightOnline = new Dictionary<string, bool>();
+        Dictionary<string, RectangleF> _prevRectOnline = new Dictionary<string, RectangleF>();
+
         // ====== 타이밍/시드 ======
         readonly Stopwatch _sw = new Stopwatch();
         long _prevMs;
@@ -76,6 +89,52 @@ namespace DodgeBattleStarter
             _timer.Tick += delegate { TickFrame(); };
             _sw.Start();
             _timer.Start();
+
+            try
+            {
+                _imgPlayerRightRaw = Image.FromFile("Assets/player_right.png");
+                _imgPlayerLeftRaw = Image.FromFile("Assets/player_left.png");
+
+                // 픽셀 아트 보존: 비율 유지 + 중앙 배치 스케일
+                _imgPlayerRight = ScaleToKeepRatio(_imgPlayerRightRaw, Size.Round(PlayerSize));
+                _imgPlayerLeft = ScaleToKeepRatio(_imgPlayerLeftRaw, Size.Round(PlayerSize));
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine("player sprite load fail: " + ex.Message);
+            }
+
+            try
+            {
+                _imgFire_SwordRaw = Image.FromFile("Assets/fire_sword.png");
+
+                // 세로 긴 느낌: 20x60 픽셀로 리사이즈
+                _imgFire_Sword = ScaleToKeepRatio(_imgFire_SwordRaw, new Size(20, 60));
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine("knife load fail: " + ex.Message);
+            }
+
+        }
+        static Image ScaleToKeepRatio(Image src, Size dst)
+        {
+            if (src == null) return null;
+            float scale = Math.Min(dst.Width / (float)src.Width, dst.Height / (float)src.Height);
+            int w = Math.Max(1, (int)(src.Width * scale));
+            int h = Math.Max(1, (int)(src.Height * scale));
+
+            var bmp = new Bitmap(dst.Width, dst.Height, System.Drawing.Imaging.PixelFormat.Format32bppPArgb);
+            using (var g = Graphics.FromImage(bmp))
+            {
+                g.Clear(Color.Transparent);
+                g.CompositingMode = System.Drawing.Drawing2D.CompositingMode.SourceOver;
+                g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.NearestNeighbor; // 픽셀 느낌 유지
+                g.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.Half;
+                g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.None;
+                g.DrawImage(src, (dst.Width - w) / 2, (dst.Height - h) / 2, w, h);
+            }
+            return bmp;
         }
 
         void TryConnectOnline()
@@ -109,6 +168,20 @@ namespace DodgeBattleStarter
                 acc -= step;
             }
             Invalidate();
+        }
+
+        // 가운데를 기준으로 가로/세로 비율만큼 축소된 사각형 반환
+        static RectangleF DeflateAroundCenter(RectangleF r, float scaleX, float scaleY)
+        {
+            // 0~1 범위로 제한
+            if (scaleX < 0f) scaleX = 0f; if (scaleX > 1f) scaleX = 1f;
+            if (scaleY < 0f) scaleY = 0f; if (scaleY > 1f) scaleY = 1f;
+
+            float newW = r.Width * scaleX;
+            float newH = r.Height * scaleY;
+            float cx = r.X + r.Width / 2f;
+            float cy = r.Y + r.Height / 2f;
+            return new RectangleF(cx - newW / 2f, cy - newH / 2f, newW, newH);
         }
 
         void Step(float dt)
@@ -181,7 +254,9 @@ namespace DodgeBattleStarter
                 Rectangle p = Rectangle.Round(_local.Rect);
                 for (int i = 0; i < _obstacles.Count; i++)
                 {
-                    if (p.IntersectsWith(Rectangle.Round(_obstacles[i])))
+                    // ★ 칼(장애물) 히트박스 축소: 가로 70%, 세로 60%
+                    var hb = Rectangle.Round(DeflateAroundCenter(_obstacles[i], 0.7f, 0.7f));
+                    if (p.IntersectsWith(hb))
                     {
                         _local.Alive = false;
                         break;
@@ -220,8 +295,8 @@ namespace DodgeBattleStarter
 
         void OnKeyDown(object s, KeyEventArgs e)
         {
-            if (e.KeyCode == Keys.Left || e.KeyCode == Keys.A) _local.Left = true;
-            if (e.KeyCode == Keys.Right || e.KeyCode == Keys.D) _local.Right = true;
+            if (e.KeyCode == Keys.Left || e.KeyCode == Keys.A) { _local.Left = true; _facingRight = false; }
+            if (e.KeyCode == Keys.Right || e.KeyCode == Keys.D) { _local.Right = true; _facingRight = true; }
             if (e.KeyCode == Keys.Up || e.KeyCode == Keys.W || e.KeyCode == Keys.Space) _local.Up = true;
 
             if (_online && _net != null)
@@ -270,6 +345,32 @@ namespace DodgeBattleStarter
             };
             _remotes.Clear();
         }
+        void DrawPlayerSprite(Graphics g, RectangleF rect, bool alive, bool highlight, bool facingRight)
+        {
+            var r = Rectangle.Round(rect);
+            Image img = facingRight ? _imgPlayerRight : _imgPlayerLeft;
+
+            if (img != null)
+            {
+                g.DrawImage(img, r);
+
+                if (!alive)
+                {
+                    using (var dim = new SolidBrush(Color.FromArgb(120, 0, 0, 0)))
+                    {
+                        g.FillRectangle(dim, r);
+                    }
+                }
+            }
+            else
+            {
+                using (var br = new SolidBrush(alive ? Color.DeepSkyBlue : Color.Gray))
+                {
+                    g.FillRectangle(br, r);
+                }
+            }
+
+        }
 
         protected override void OnPaint(PaintEventArgs e)
         {
@@ -286,24 +387,60 @@ namespace DodgeBattleStarter
 
             if (_online)
             {
-                using (var obs = new SolidBrush(Color.OrangeRed))
+                if (_imgFire_Sword != null)
                 {
                     for (int i = 0; i < _obsOnline.Count; i++)
-                        g.FillRectangle(obs, Rectangle.Round(_obsOnline[i]));
+                    {
+                        var r = Rectangle.Round(_obsOnline[i]);
+
+                        // 세로로 긴 칼 느낌 (가로 0.8배, 세로 2.5배)
+                        float w = r.Width * 0.8f;
+                        float h = r.Height * 2.5f;
+                        float x = r.X + (r.Width - w) / 2f;
+                        float y = r.Y - (h - r.Height) / 2f;
+
+                        g.DrawImage(_imgFire_Sword, x, y, w, h);
+                    }
+                }
+                else
+                {
+                    using (var obs = new SolidBrush(Color.OrangeRed))
+                    {
+                        for (int i = 0; i < _obsOnline.Count; i++)
+                            g.FillRectangle(obs, Rectangle.Round(_obsOnline[i]));
+                    }
                 }
 
                 foreach (var kv in _playersOnline)
                 {
                     var id = kv.Key;
-                    var r = kv.Value;
-                    bool alive = _aliveOnline.Contains(id);
-                    using (var br = new SolidBrush(alive
-                        ? (id == (_net != null ? _net.MyId : "") ? Color.DeepSkyBlue : Color.MediumPurple)
-                        : Color.Gray))
+                    var rect = kv.Value;
+
+                    // 기본값 유지
+                    bool faceRight = true;
+                    bool prevKnown = _prevRectOnline.TryGetValue(id, out var prevRect);
+
+                    if (prevKnown)
                     {
-                        g.FillRectangle(br, Rectangle.Round(r));
+                        float dx = rect.X - prevRect.X;
+                        if (Math.Abs(dx) > 0.5f) // 작은 흔들림 무시
+                            faceRight = dx >= 0;
+                        else if (_facingRightOnline.TryGetValue(id, out var prevDir))
+                            faceRight = prevDir; // 정지 중엔 이전 방향 유지
                     }
+
+                    _prevRectOnline[id] = rect;
+                    _facingRightOnline[id] = faceRight;
+
+                    bool alive = _aliveOnline.Contains(id);
+                    bool me = (_net != null && id == _net.MyId);
+
+                    // 내 캐릭터는 로컬 입력 기준으로 확정
+                    if (me) faceRight = _facingRight;
+
+                    DrawPlayerSprite(e.Graphics, rect, alive, highlight: me, facingRight: faceRight);
                 }
+
 
                 using (var white = new SolidBrush(Color.White))
                 using (var font = new Font("Segoe UI", 10))
@@ -330,7 +467,6 @@ namespace DodgeBattleStarter
                 var snapForHud = _net.TryGetSnapshot();
                 if (snapForHud != null)
                 {
-                    // 반투명 패널 브러시
                     using (var panelBg = new SolidBrush(Color.FromArgb(140, 0, 0, 0)))
                     using (var white = new SolidBrush(Color.White))
                     using (var gray = new SolidBrush(Color.Gainsboro))
@@ -344,13 +480,11 @@ namespace DodgeBattleStarter
                         float roundX = (ClientSize.Width - roundSz.Width) / 2f;
                         float roundY = 8f;
 
-                        // 라운드 패널 배경
                         RectangleF roundPanel = new RectangleF(roundX - 12, roundY - 6, roundSz.Width + 24, roundSz.Height + 12);
                         e.Graphics.FillRectangle(panelBg, roundPanel);
                         e.Graphics.DrawString(roundText, titleFont, white, roundX, roundY);
 
-                        // 2) 우측 상단: SCOREBOARD (상위 6명)
-                        // 정렬: 점수 내림차순, 동점이면 이름
+                        // 2) 우측 상단: SCOREBOARD
                         var sorted = new List<NetPlayer>(snapForHud.Players);
                         sorted.Sort(delegate (NetPlayer a, NetPlayer b)
                         {
@@ -361,45 +495,106 @@ namespace DodgeBattleStarter
 
                         int show = Math.Min(6, sorted.Count);
                         float sbWidth = 220f;
-                        float sbRowH = 15f;
-                        float sbHeadH = 32f;
+                        float sbRowH = 15f;           // 촘촘한 행 간격
+                        float sbHeadH = 28f;           // 헤더 높이
                         float sbX = ClientSize.Width - sbWidth - 12;
                         float sbY = 8f;
 
-                        // 배경
-                        RectangleF sbRect = new RectangleF(sbX, sbY, sbWidth, sbHeadH + show * sbRowH + 10);
+                        // 패널 배경
+                        RectangleF sbRect = new RectangleF(sbX, sbY, sbWidth, sbHeadH + show * sbRowH + 12);
                         e.Graphics.FillRectangle(panelBg, sbRect);
 
                         // 헤더
-                        e.Graphics.DrawString("SCOREBOARD", headFont, white, sbX + 10, sbY + 6);
+                        e.Graphics.DrawString("SCORE BOARD", headFont, white, sbX + 10, sbY + 6);
 
-                        // 컬럼 헤더(작게)
-                        float colNameX = sbX + 10;
+                        // 컬럼 헤더
+                        float colNameX = sbX + 10;            // 헤더용 최초 위치
                         float colScoreX = sbX + sbWidth - 60;
-                        e.Graphics.DrawString("Player", smallFont, gray, colNameX, sbY + sbHeadH - 2);
-                        e.Graphics.DrawString("Score", smallFont, gray, colScoreX, sbY + sbHeadH - 2);
+                        e.Graphics.DrawString("Player", smallFont, gray, colNameX, sbY + sbHeadH + 2);
+                        e.Graphics.DrawString("Score", smallFont, gray, colScoreX, sbY + sbHeadH + 2);
 
-                        // 목록
+                        // 목록 (★ 겹침 방지: 첫 행 시작 Y를 확 내려줌)
+                        float rowStartY = sbY + sbHeadH + 16f; // 헤더 아래 여백
                         for (int i = 0; i < show; i++)
                         {
                             var p = sorted[i];
-                            float rowY = sbY + sbHeadH + i * sbRowH + 10;
+                            float rowY = rowStartY + (i * sbRowH);
 
-                            // 내 아이디 강조
-                            bool me = (_net != null && p.Id == _net.MyId);
-                            using (var rowBrush = new SolidBrush(me ? Color.LightSkyBlue : Color.White))
+                            // 랭크 배경(메달색)
+                            Color bgColor =
+                                (i == 0) ? Color.FromArgb(60, 255, 215, 0) :
+                                (i == 1) ? Color.FromArgb(50, 192, 192, 192) :
+                                (i == 2) ? Color.FromArgb(50, 205, 127, 50) :
+                                           Color.FromArgb(0, 0, 0, 0);
+                            if (bgColor.A > 0)
                             {
-                                // 닉네임 (너무 길면 줄임)
-                                string name = string.IsNullOrEmpty(p.Name) ? p.Id : p.Name;
-                                if (name.Length > 12) name = name.Substring(0, 12) + "…";
+                                using (var rankBg = new SolidBrush(bgColor))
+                                    e.Graphics.FillRectangle(rankBg, new RectangleF(sbX + 4, rowY - 2, sbWidth - 8, sbRowH + 2));
+                            }
 
-                                e.Graphics.DrawString(name, smallFont, rowBrush, colNameX, rowY);
-                                e.Graphics.DrawString(p.Score.ToString(), smallFont, rowBrush, colScoreX, rowY);
+                            // 이름 색상: 나(하늘색 Bold) / 생존(흰색) / 사망(회색)
+                            bool me = (_net != null && p.Id == _net.MyId);
+                            Brush rowBrush = me
+                                ? (Brush)new SolidBrush(Color.LightSkyBlue)
+                                : (p.Alive ? (Brush)new SolidBrush(Color.White) : (Brush)new SolidBrush(Color.Gray));
+
+                            // 닉네임 축약
+                            string name = string.IsNullOrEmpty(p.Name) ? p.Id : p.Name;
+                            if (name.Length > 12) name = name.Substring(0, 12) + "…";
+
+                            // ── 랭크 뱃지(숫자)
+                            float badgeW = 18f;
+                            float badgeH = sbRowH + 2;
+                            float badgeX = sbX + 6;
+                            float badgeY = rowY - 2;
+
+                            using (var badgeBrush = new SolidBrush(Color.FromArgb(200, 0, 0, 0)))
+                            using (var badgePen = new Pen(Color.DimGray, 1))
+                            using (var rankFont = new Font("Segoe UI", 9, FontStyle.Bold))
+                            {
+                                e.Graphics.FillRectangle(badgeBrush, badgeX, badgeY, badgeW, badgeH);
+                                e.Graphics.DrawRectangle(badgePen, badgeX, badgeY, badgeW, badgeH);
+
+                                string rankStr = (i + 1).ToString();
+                                var sz = e.Graphics.MeasureString(rankStr, rankFont);
+                                e.Graphics.DrawString(rankStr, rankFont, Brushes.White,
+                                    badgeX + (badgeW - sz.Width) / 2f,
+                                    badgeY + (badgeH - sz.Height) / 2f);
+                            }
+
+                            // 이름/점수 X 위치 (★ 이름은 뱃지 오른쪽으로 충분히 밀기)
+                            float namePad = 12f;
+                            float nameX = badgeX + badgeW + namePad;   // ← 여기서부터 이름
+                            float scoreX = colScoreX;
+
+                            // 이름/점수 그리기
+                            using (rowBrush)
+                            using (var textFont = new Font("Segoe UI", 10, me ? FontStyle.Bold : FontStyle.Regular))
+                            {
+                                e.Graphics.DrawString(name, textFont, rowBrush, nameX, rowY);
+                                e.Graphics.DrawString(p.Score.ToString(), textFont, rowBrush, scoreX, rowY);
                             }
                         }
 
-                        // 3) 라운드 종료 안내(투표)
-                        if (snapForHud.Phase == "await")
+                        // 3) 중앙 오버레이: 카운트다운 또는 투표 안내  (★ panelBg/white 재사용)
+                        if (snapForHud.Phase == "countdown")
+                        {
+                            int sec = (snapForHud.CountdownMs + 999) / 1000;
+                            string msg = (sec > 0) ? sec.ToString() : "START!";
+                            using (var big = new Font("Segoe UI", 28, FontStyle.Bold))
+                            {
+                                SizeF sz = e.Graphics.MeasureString(msg, big);
+                                RectangleF mid = new RectangleF(
+                                    (ClientSize.Width - sz.Width) / 2f - 20,
+                                    (ClientSize.Height - sz.Height) / 2f - 12,
+                                    sz.Width + 40, sz.Height + 24);
+                                e.Graphics.FillRectangle(panelBg, mid);
+                                e.Graphics.DrawString(msg, big, white,
+                                    (ClientSize.Width - sz.Width) / 2f,
+                                    (ClientSize.Height - sz.Height) / 2f);
+                            }
+                        }
+                        else if (snapForHud.Phase == "await")
                         {
                             using (var big = new Font("Segoe UI", 18, FontStyle.Bold))
                             {
@@ -418,20 +613,42 @@ namespace DodgeBattleStarter
                         }
                     }
                 }
-
                 return;
             }
 
             // ====== 오프라인 렌더링 ======
-            using (var obs2 = new SolidBrush(Color.OrangeRed))
+            foreach (var obs in _obstacles)
             {
-                for (int i = 0; i < _obstacles.Count; i++)
-                    g.FillRectangle(obs2, Rectangle.Round(_obstacles[i]));
+                if (_imgFire_Sword != null)
+                {
+                    var r = Rectangle.Round(obs);
+                    // 가로는 약간 좁게, 세로는 길게
+                    float w = r.Width * 0.8f;
+                    float h = r.Height * 2.5f;
+                    float x = r.X + (r.Width - w) / 2f;
+                    float y = r.Y - (h - r.Height) / 2f;
+
+                    g.DrawImage(_imgFire_Sword, x, y, w, h);
+                }
+                else
+                {
+                    // 이미지가 없으면 기존처럼 사각형으로 표시
+                    using (var obs2 = new SolidBrush(Color.OrangeRed))
+                    {
+                        g.FillRectangle(obs2, Rectangle.Round(obs));
+                    }
+                }
             }
 
-            DrawPlayer(g, _local);
+
+            DrawPlayerSprite(e.Graphics, _local.Rect, _local.Alive, highlight: true, facingRight: _facingRight);
             foreach (var kv in _remotes)
-                DrawPlayer(g, kv.Value);
+            {
+                var p = kv.Value;
+                // 간단히: 로컬 기준과 동일 논리(왼/오 입력 상태로 추정) 또는 p.vx>0 여부 이용 가능
+                bool facingRight = p.vx >= 0; // 오프라인 봇용
+                DrawPlayerSprite(e.Graphics, p.Rect, p.Alive, highlight: false, facingRight: facingRight);
+            }
 
             using (var white2 = new SolidBrush(Color.White))
             using (var font2 = new Font("Segoe UI", 10, FontStyle.Regular))
@@ -455,6 +672,18 @@ namespace DodgeBattleStarter
                         (ClientSize.Height - sz.Height) / 2f);
                 }
             }
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                _imgPlayerRight?.Dispose();
+                _imgPlayerLeft?.Dispose();
+                _imgPlayerRightRaw?.Dispose();
+                _imgPlayerLeftRaw?.Dispose();
+            }
+            base.Dispose(disposing);
         }
 
         void DrawPlayer(Graphics g, Player p)
