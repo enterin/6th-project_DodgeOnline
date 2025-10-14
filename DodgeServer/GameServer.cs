@@ -70,7 +70,6 @@ namespace DodgeServer
         const int WorldMargin = 24;
         const int GroundMargin = 84;
         const int SnapshotHz = 20;
-        const int SpawnMs = 750;
 
         const int PlayerW = 40;
         const int PlayerH = 40;
@@ -112,7 +111,6 @@ namespace DodgeServer
 
         readonly Stopwatch _sw = new Stopwatch();
         long _prevMs;
-        int _spawnAccumMs;
         int _tick;
 
         readonly int _seed = Environment.TickCount;
@@ -124,6 +122,25 @@ namespace DodgeServer
 
         Phase _phase = Phase.Playing;
         readonly HashSet<string> _respawnVotes = new HashSet<string>();
+
+        // ====== 종류별 스폰 간격 ======
+        const int KnifeSpawnMs = 750;
+        const int FireSpawnMs = 600;
+        const int RockSpawnMs = 750;
+
+        int _spawnAccumKnifeMs;
+        int _spawnAccumFireMs;
+        int _spawnAccumRockMs;
+
+        // 가속/버스트 방지용: 이전 유효주기 기억 + 해금 상태 + 틱당 컷
+        int _prevKnifeEffMs = KnifeSpawnMs;
+        int _prevFireEffMs = FireSpawnMs;
+        int _prevRockEffMs = RockSpawnMs;
+        bool _prevKnifeUnlocked = false;
+        bool _prevFireUnlocked = false;
+        bool _prevRockUnlocked = false;
+        const int MaxSpawnPerTickPerKind = 2;     // 틱당 종류별 최대 스폰 수
+        const int MinEffMs = 120;                 // 가속 최소 주기(너무 급격한 폭주 방지)
 
         public GameServer(string host, int port) { _host = host; _port = port; }
 
@@ -263,7 +280,7 @@ namespace DodgeServer
         // 시간 경과에 따라 해금된 종류 목록을 돌려줌
         List<ObKind> GetUnlockedKinds()
         {
-            // 0~15s: Knife만, 15~45s: Knife+Rock, 45s~: Knife+Rock+Fire
+            // 0~10s: Knife만, 10~20s: Knife+Fire, 20s~: Knife+Rock+Fire
             if (_roundElapsedMs < 10000) return new List<ObKind> { ObKind.Knife };
             if (_roundElapsedMs < 20000) return new List<ObKind> { ObKind.Knife, ObKind.Fire };
             return new List<ObKind> { ObKind.Knife, ObKind.Rock, ObKind.Fire };
@@ -285,29 +302,13 @@ namespace DodgeServer
             return 380f; // Fire
         }
 
-        // 가중치로 종류 선택 (Knife 50, Rock 30, Fire 20)
-        ObKind PickKindWeighted(List<ObKind> unlocked)
+        // === 특정 종류만 스폰 ===
+        void SpawnObstacleOfKind(ObKind kind)
         {
-            int knifeW = 50, rockW = 30, fireW = 20;
-            var bag = new List<ObKind>();
-            foreach (var k in unlocked)
-            {
-                int w = (k == ObKind.Knife) ? knifeW : (k == ObKind.Rock ? rockW : fireW);
-                for (int i = 0; i < w; i++) bag.Add(k);
-            }
-            return bag[_rng.Next(bag.Count)];
-        }
-
-        void SpawnObstacle()
-        {
-            var unlocked = GetUnlockedKinds();
-            var kind = PickKindWeighted(unlocked);
-
             float w, h; GetSize(kind, out w, out h);
             int x = _rng.Next(WorldMargin, _worldW - WorldMargin - (int)w);
             _obstacles.Add(new Ob(x, -h, w, h, kind));
             Console.WriteLine($"[SPAWN] {kind} x={x}");
-
         }
 
         void UpdateObstacles(float dt)
@@ -330,25 +331,12 @@ namespace DodgeServer
             }
         }
 
-        // 히트박스 축소 유틸
-        static RectangleF DeflateAroundCenter(RectangleF r, float scaleX, float scaleY)
+        // === 30초마다 스폰 속도 ×1.2 → 주기 ÷1.2 ===
+        float GetSpawnScale()
         {
-            if (scaleX < 0f) scaleX = 0f; if (scaleX > 1f) scaleX = 1f;
-            if (scaleY < 0f) scaleY = 0f; if (scaleY > 1f) scaleY = 1f;
-
-            float newW = r.Width * scaleX;
-            float newH = r.Height * scaleY;
-            float cx = r.X + r.Width / 2f;
-            float cy = r.Y + r.Height / 2f;
-            return new RectangleF(cx - newW / 2f, cy - newH / 2f, newW, newH);
-        }
-
-        static void GetHitScale(ObKind k, out float sx, out float sy)
-        {
-            // 칼: 가로 더 타이트, 불: 전체 타이트, 바위: 약간만
-            if (k == ObKind.Knife) { sx = 0.60f; sy = 0.70f; }
-            else if (k == ObKind.Rock) { sx = 0.85f; sy = 0.85f; }
-            else { sx = 0.65f; sy = 0.65f; } // Fire
+            int stages = _roundElapsedMs / 30000;          // 0,1,2,...
+            double scale = Math.Pow(1.2, stages);          // 1.0, 1.2, 1.44, ...
+            return (float)scale;
         }
 
         // ===== 메인 루프 =====
@@ -382,7 +370,7 @@ namespace DodgeServer
             {
                 if (_phase == Phase.Countdown)
                 {
-                    _countdownMsLeft -= (int)(dt * 1000f);   //  누락된 감소 로직 추가
+                    _countdownMsLeft -= (int)(dt * 1000f);
                     if (_countdownMsLeft <= 0)
                     {
                         _countdownMsLeft = 0;
@@ -397,15 +385,96 @@ namespace DodgeServer
                 {
                     _roundElapsedMs += (int)(dt * 1000f);
 
-                    // 스폰
-                    _spawnAccumMs += (int)(dt * 1000);
-                    while (_spawnAccumMs >= SpawnMs)
+                    // ===== 해금 상태/유효 주기 계산 =====
+                    var unlocked = GetUnlockedKinds();
+                    bool knifeUnl = unlocked.Contains(ObKind.Knife);
+                    bool fireUnl = unlocked.Contains(ObKind.Fire);
+                    bool rockUnl = unlocked.Contains(ObKind.Rock);
+
+                    float spawnScale = GetSpawnScale();
+                    int knifeMsEff = (int)Math.Max(MinEffMs, KnifeSpawnMs / spawnScale);
+                    int fireMsEff = (int)Math.Max(MinEffMs, FireSpawnMs / spawnScale);
+                    int rockMsEff = (int)Math.Max(MinEffMs, RockSpawnMs / spawnScale);
+
+                    // ===== 해금 전 누적 금지 & 해금 순간 0으로 초기화 =====
+                    int addMs = (int)(dt * 1000);
+
+                    if (knifeUnl)
                     {
-                        _spawnAccumMs -= SpawnMs;
-                        SpawnObstacle();
+                        if (!_prevKnifeUnlocked) { _spawnAccumKnifeMs = 0; _prevKnifeEffMs = knifeMsEff; }
+                        _spawnAccumKnifeMs += addMs;
+                    }
+                    else _spawnAccumKnifeMs = 0;
+
+                    if (fireUnl)
+                    {
+                        if (!_prevFireUnlocked) { _spawnAccumFireMs = 0; _prevFireEffMs = fireMsEff; }
+                        _spawnAccumFireMs += addMs;
+                    }
+                    else _spawnAccumFireMs = 0;
+
+                    if (rockUnl)
+                    {
+                        if (!_prevRockUnlocked) { _spawnAccumRockMs = 0; _prevRockEffMs = rockMsEff; }
+                        _spawnAccumRockMs += addMs;
+                    }
+                    else _spawnAccumRockMs = 0;
+
+                    // ===== 가속 단계 변화 시 누적 리스케일(폭주 방지) =====
+                    if (knifeMsEff != _prevKnifeEffMs)
+                    {
+                        _spawnAccumKnifeMs = (int)Math.Min(_spawnAccumKnifeMs * (double)knifeMsEff / _prevKnifeEffMs, knifeMsEff - 1);
+                        _prevKnifeEffMs = knifeMsEff;
+                    }
+                    if (fireMsEff != _prevFireEffMs)
+                    {
+                        _spawnAccumFireMs = (int)Math.Min(_spawnAccumFireMs * (double)fireMsEff / _prevFireEffMs, fireMsEff - 1);
+                        _prevFireEffMs = fireMsEff;
+                    }
+                    if (rockMsEff != _prevRockEffMs)
+                    {
+                        _spawnAccumRockMs = (int)Math.Min(_spawnAccumRockMs * (double)rockMsEff / _prevRockEffMs, rockMsEff - 1);
+                        _prevRockEffMs = rockMsEff;
                     }
 
-                    // 플레이어 물리/충돌
+                    // ===== 종류별 스폰 (틱당 최대 개수 제한) =====
+                    if (knifeUnl)
+                    {
+                        int spawned = 0;
+                        while (_spawnAccumKnifeMs >= knifeMsEff && spawned < MaxSpawnPerTickPerKind)
+                        {
+                            _spawnAccumKnifeMs -= knifeMsEff;
+                            SpawnObstacleOfKind(ObKind.Knife);
+                            spawned++;
+                        }
+                    }
+                    if (fireUnl)
+                    {
+                        int spawned = 0;
+                        while (_spawnAccumFireMs >= fireMsEff && spawned < MaxSpawnPerTickPerKind)
+                        {
+                            _spawnAccumFireMs -= fireMsEff;
+                            SpawnObstacleOfKind(ObKind.Fire);
+                            spawned++;
+                        }
+                    }
+                    if (rockUnl)
+                    {
+                        int spawned = 0;
+                        while (_spawnAccumRockMs >= rockMsEff && spawned < MaxSpawnPerTickPerKind)
+                        {
+                            _spawnAccumRockMs -= rockMsEff;
+                            SpawnObstacleOfKind(ObKind.Rock);
+                            spawned++;
+                        }
+                    }
+
+                    // ===== 이전 해금 상태 갱신 =====
+                    _prevKnifeUnlocked = knifeUnl;
+                    _prevFireUnlocked = fireUnl;
+                    _prevRockUnlocked = rockUnl;
+
+                    // ===== 플레이어 물리/충돌 =====
                     foreach (var kv in _players)
                     {
                         var p = kv.Value;
@@ -422,7 +491,7 @@ namespace DodgeServer
 
                         ApplyBounds(p);
 
-                        // 플레이어 히트박스 (살짝 축소 권장)
+                        // 플레이어 히트박스 (살짝 축소)
                         var pRectRaw = new RectangleF(p.X, p.Y, PlayerW, PlayerH);
                         var pHit = Rectangle.Round(DeflateAroundCenter(pRectRaw, 0.90f, 0.90f));
 
@@ -430,7 +499,6 @@ namespace DodgeServer
                         for (int i = 0; i < _obstacles.Count; i++)
                         {
                             var obRect = _obstacles[i];
-                            // 🔸 불일 때는 더 작게 (0.5)
                             float scale = 0.7f;
                             if (_obstacles[i].Kind == ObKind.Fire) scale = 0.5f;
                             var obHit = Rectangle.Round(DeflateAroundCenter(obRect.Rect, scale, scale));
@@ -443,7 +511,7 @@ namespace DodgeServer
                         }
                     }
 
-                    // 장애물 업데이트/제거 + 생존점수는 UpdateObstacles 내부에서 처리
+                    // 장애물 업데이트/제거 + 생존점수
                     UpdateObstacles(dt);
 
                     // 모두 사망 감지 → 투표 대기
@@ -458,9 +526,9 @@ namespace DodgeServer
                         Console.WriteLine("[ROUND] All dead -> AwaitingRestart (press R to vote)");
                     }
                 }
-                else // AwaitingRestart
+                else
                 {
-                    // 월드 업데이트 정지
+                    // AwaitingRestart: 월드 업데이트 정지
                 }
             }
         }
@@ -481,6 +549,18 @@ namespace DodgeServer
         {
             float groundY = _worldH - GroundMargin - PlayerH;
             return Math.Abs(p.Y - groundY) < 0.5f;
+        }
+
+        static RectangleF DeflateAroundCenter(RectangleF r, float scaleX, float scaleY)
+        {
+            if (scaleX < 0f) scaleX = 0f; if (scaleX > 1f) scaleX = 1f;
+            if (scaleY < 0f) scaleY = 0f; if (scaleY > 1f) scaleY = 1f;
+
+            float newW = r.Width * scaleX;
+            float newH = r.Height * scaleY;
+            float cx = r.X + r.Width / 2f;
+            float cy = r.Y + r.Height / 2f;
+            return new RectangleF(cx - newW / 2f, cy - newH / 2f, newW, newH);
         }
 
         void SnapshotLoop()
@@ -532,7 +612,18 @@ namespace DodgeServer
             _countdownMsLeft = CountdownMs;
 
             _obstacles.Clear();
-            _spawnAccumMs = 0;
+
+            // 종류별 스폰 누적/이전주기/해금상태 리셋
+            _spawnAccumKnifeMs = 0;
+            _spawnAccumFireMs = 0;
+            _spawnAccumRockMs = 0;
+            _prevKnifeEffMs = KnifeSpawnMs;
+            _prevFireEffMs = FireSpawnMs;
+            _prevRockEffMs = RockSpawnMs;
+            _prevKnifeUnlocked = false;
+            _prevFireUnlocked = false;
+            _prevRockUnlocked = false;
+
             _tick = 0;
 
             _round += 1;
