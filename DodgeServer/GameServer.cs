@@ -65,6 +65,10 @@ namespace DodgeServer
 
         public readonly byte[] LenBuf = new byte[4];
         public readonly byte[] BodyBuf = new byte[64 * 1024];
+
+        // ★ 추가
+        public bool Ready = false;
+        public int ColorRgb = 0x39A9F9;   // 기본 하늘색
     }
 
 
@@ -97,7 +101,7 @@ namespace DodgeServer
         const float KB_SpeedSafety = 1.05f;  // 속도 계산 여유(살짝 덜/넘치지 않게)
 
         // 라운드/카운트다운/페이즈
-        enum Phase { Countdown, Playing, AwaitingRestart }
+        enum Phase { Lobby, Countdown, Playing, AwaitingRestart }
         int _round = 1;
         const int CountdownMs = 3000; // 3초
         int _countdownMsLeft = 0;
@@ -173,7 +177,8 @@ namespace DodgeServer
 
         public void Start()
         {
-            _phase = Phase.Countdown; _countdownMsLeft = CountdownMs;
+            _phase = Phase.Lobby;
+            _countdownMsLeft = 0;
             _rng = new Random(_seed);
             _listener = new TcpListener(IPAddress.Parse(_host), _port);
             _listener.Start();
@@ -220,6 +225,11 @@ namespace DodgeServer
 
                     lock (_lock) _players[p.Id] = p;
 
+                    // p 생성 직후
+                    p.Name = "guest";
+                    p.ColorRgb = _rng.Next(0x30, 0xE0) << 16 | _rng.Next(0x30, 0xE0) << 8 | _rng.Next(0x30, 0xE0); // 파스텔 느낌
+                    p.Ready = false;
+
                     string welcome = "{"
                         + "\"cmd\":\"WELCOME\","
                         + "\"id\":\"" + p.Id + "\","
@@ -228,6 +238,8 @@ namespace DodgeServer
                         + "\"snapshot_hz\":" + SnapshotHz
                         + "}";
                     Wire.SendJson(ns, welcome);
+
+                    BroadcastLobby();  // ★ 새 유저 입장 반영
 
                     Console.WriteLine("[JOIN] " + p.Id + " connected");
 
@@ -278,10 +290,75 @@ namespace DodgeServer
                             }
                         }
                     }
+                    else if (json.IndexOf("\"cmd\":\"SET_NAME\"") >= 0)
+                    {
+                        string nm = ExtractString(json, "name");
+                        lock (_lock)
+                        {
+                            if (!string.IsNullOrEmpty(nm)) p.Name = nm;
+                            BroadcastLobby();
+                        }
+                    }
+                    else if (json.IndexOf("\"cmd\":\"SET_COLOR\"") >= 0)
+                    {
+                        string col = ExtractString(json, "color"); // "#RRGGBB"
+                        lock (_lock)
+                        {
+                            p.ColorRgb = TryParseHtmlRgb(col, p.ColorRgb);
+                            BroadcastLobby();
+                        }
+                    }
+                    else if (json.IndexOf("\"cmd\":\"READY\"") >= 0)
+                    {
+                        bool r = ExtractBool(json, "ready");
+                        lock (_lock)
+                        {
+                            p.Ready = r;
+                            BroadcastLobby();
+                            TryStartCountdownFromLobby_Locked();  // ★ 전원 Ready면 시작
+                        }
+                    }
                 }
             }
             catch { }
             finally { Disconnect(p); }
+        }
+
+        static int TryParseHtmlRgb(string s, int defRgb)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(s)) return defRgb;
+                if (s[0] == '#') s = s.Substring(1);
+                if (s.Length != 6) return defRgb;
+                return int.Parse(s, NumberStyles.HexNumber);
+            }
+            catch { return defRgb; }
+        }
+
+        void TryStartCountdownFromLobby_Locked()
+        {
+            if (_phase != Phase.Lobby) return;
+            if (_players.Count == 0) return;
+            foreach (var kv in _players) if (!kv.Value.Ready) return;
+
+            _phase = Phase.Countdown;
+            _countdownMsLeft = CountdownMs;
+            _roundElapsedMs = 0;
+            _obstacles.Clear();
+            _respawnVotes.Clear();
+            _tick = 0;
+
+            foreach (var kv in _players)
+            {
+                var pl = kv.Value;
+                pl.Alive = true; pl.VX = pl.VY = 0; pl.Score = 0;
+                float startX = (_worldW / 2f) - (PlayerW / 2f);
+                float groundY = _worldH - GroundMargin - PlayerH;
+                pl.X = startX; pl.Y = groundY;
+            }
+
+            BroadcastSnapshot(); // 카운트다운 화면 즉시 표시
         }
 
         void Disconnect(Player p)
@@ -298,6 +375,13 @@ namespace DodgeServer
                     // 투표 대기 중이고 남은 인원 수와 투표 수가 맞으면 즉시 재시작
                     if (_phase == Phase.AwaitingRestart && _players.Count > 0 && _respawnVotes.Count >= _players.Count)
                         RestartRound_Locked();
+
+                    // ★ 추가: 로비 중 누가 나갔으면 로비 갱신 + 자동 시작 재시도
+                    if (_phase == Phase.Lobby)
+                    {
+                        BroadcastLobby();
+                        TryStartCountdownFromLobby_Locked();
+                    }
                 }
             }
         }
@@ -466,6 +550,12 @@ namespace DodgeServer
 
             lock (_lock)
             {
+                if (_phase == Phase.Lobby)
+                {
+                    // 로비는 물리/스폰 정지 (로비 패킷은 이벤트 시에만 전송)
+                    return;
+                }
+
                 if (_phase == Phase.Countdown)
                 {
                     _countdownMsLeft -= (int)(dt * 1000f);
@@ -656,6 +746,15 @@ namespace DodgeServer
             while (_running)
             {
                 Thread.Sleep(intervalMs);
+
+                // ★ 로비에선 스냅샷 대신(이미 이벤트마다 LOBBY를 보냄) 전송 생략
+                if (_phase == Phase.Lobby)
+                {
+                    // 원하면 1초에 한 번 정도 BroadcastLobby()를 넣어도 됨
+                    // if (++dbg % SnapshotHz == 0) BroadcastLobby();
+                    continue;
+                }
+
                 BroadcastSnapshot();
 
                 if (++dbg % SnapshotHz == 0)
@@ -752,14 +851,49 @@ namespace DodgeServer
             return value;
         }
 
+        void BroadcastLobby()
+        {
+            string json;
+            lock (_lock)
+            {
+                var sb = new StringBuilder(2048);
+                sb.Append("{\"cmd\":\"LOBBY\",\"phase\":\"lobby\",\"players\":[");
+                bool first = true;
+                int ready = 0, need = 0;
+
+                foreach (var kv in _players)
+                {
+                    var p = kv.Value; need++;
+                    if (p.Ready) ready++;
+
+                    if (!first) sb.Append(",");
+                    first = false;
+                    sb.Append("{\"id\":\"").Append(p.Id)
+                      .Append("\",\"name\":\"").Append(Escape(p.Name))
+                      .Append("\",\"color\":\"#").Append(p.ColorRgb.ToString("X6"))
+                      .Append("\",\"ready\":").Append(p.Ready ? "true" : "false")
+                      .Append("}");
+                }
+                sb.Append("],\"need_count\":").Append(need)
+                  .Append(",\"ready_count\":").Append(ready).Append("}");
+
+                json = sb.ToString();
+            }
+
+            foreach (var kv in _players)
+                try { Wire.SendJson(kv.Value.Ns, json); } catch { }
+        }
+
         void BroadcastSnapshot()
         {
             StringBuilder sb = new StringBuilder(4096);
             sb.Append("{\"cmd\":\"SNAPSHOT\",\"tick\":").Append(_tick).Append(",")
               .Append("\"round\":").Append(_round).Append(",")
+              // ★ phase 문자열 수정 (Lobby도 포함)
               .Append("\"phase\":\"")
                  .Append(_phase == Phase.Playing ? "playing" :
-                         _phase == Phase.AwaitingRestart ? "await" : "countdown")
+                         _phase == Phase.AwaitingRestart ? "await" :
+                         _phase == Phase.Countdown ? "countdown" : "lobby")
               .Append("\",")
               .Append("\"countdown_ms\":").Append(_countdownMsLeft).Append(",")
               .Append("\"vote_count\":").Append(_respawnVotes.Count).Append(",")
@@ -808,5 +942,6 @@ namespace DodgeServer
                 }
             }
         }
+
     }
 }

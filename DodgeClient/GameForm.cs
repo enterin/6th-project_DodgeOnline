@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Drawing;
 using System.Reflection;  // 리플렉션으로 스냅샷 장애물 필드 접근
 using System.Windows.Forms;
+using static DodgeBattleStarter.NetClient;
 
 namespace DodgeBattleStarter
 {
@@ -57,8 +58,19 @@ namespace DodgeBattleStarter
         public int Seed { get; private set; } = Environment.TickCount;
         Random _rng;
 
+        // ==== LOBBY UI ====
+        private Panel _pLobby;
+        private ListView _lvLobby;
+        private TextBox _tbName;
+        private Panel _pColorPreview;
+        private Button _btnPickColor;
+        private Button _btnReady;
+
+        private bool _readyLocal = false;
+        private string _colorHtml = "#39A9F9";
+
         // ====== 오프라인용 ======
-        class Player
+        class Player    
         {
             public string Id = "local";
             public Color Color = Color.DeepSkyBlue;
@@ -86,7 +98,7 @@ namespace DodgeBattleStarter
         struct OnlineOb
         {
             public RectangleF Rect;
-            public int Kind; // 서버 ObKind (0=Knife, 1=Rock, 2=Fire)
+            public int Kind; // 서버 ObKind: 0=Knife, 1=Boom, 2=Fire, 3=Explosion
             public OnlineOb(RectangleF r, int k) { Rect = r; Kind = k; }
         }
         List<OnlineOb> _obsOnline = new List<OnlineOb>();
@@ -103,6 +115,8 @@ namespace DodgeBattleStarter
             DoubleBuffered = true;
             FormBorderStyle = FormBorderStyle.FixedSingle;
             MaximizeBox = false;
+
+            this.KeyPreview = true;  // ★ 폼이 키 입력을 먼저 받게 함 (중요)
 
             KeyDown += OnKeyDown;
             KeyUp += OnKeyUp;
@@ -178,6 +192,186 @@ namespace DodgeBattleStarter
             {
                 Debug.WriteLine("boom frames load fail: " + ex.Message);
             }
+
+            // 로비 UI 빌드
+            BuildLobbyUi();
+
+            // 내 닉네임 초기값(원하면 바꿔도 무방)
+            _tbName.Text = _nickname;
+        }
+
+        private void BuildLobbyUi()
+        {
+            // 오른쪽 사이드 패널 (폭/패딩 넉넉히)
+            _pLobby = new Panel
+            {
+                Dock = DockStyle.Right,
+                Width = 320,                         // ← 280 → 320
+                Padding = new Padding(8),
+                BackColor = Color.FromArgb(30, 30, 34)
+            };
+            Controls.Add(_pLobby);
+
+            // 플레이어 리스트 (왼쪽 본문)
+            _lvLobby = new ListView
+            {
+                View = View.Details,
+                Dock = DockStyle.Fill,
+                FullRowSelect = true,
+                HeaderStyle = ColumnHeaderStyle.Nonclickable,
+                BackColor = Color.FromArgb(22, 24, 28),
+                ForeColor = Color.White
+            };
+            _lvLobby.Columns.Add("#", 36);
+            _lvLobby.Columns.Add("Name", 150);
+            _lvLobby.Columns.Add("Ready", 70);
+
+            // 리스트를 담을 중앙 패널
+            Panel center = new Panel { Dock = DockStyle.Fill, BackColor = Color.FromArgb(22, 24, 28) };
+            center.Controls.Add(_lvLobby);
+            Controls.Add(center);
+
+            // 우측 편집/버튼 영역 (아래 고정 → 전체 채우기 + 스크롤)
+            FlowLayoutPanel pnl = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Fill,               // ★ Fill
+                AutoScroll = true,                   // ★ 스크롤 허용
+                WrapContents = false,                // ★ 세로 스택
+                FlowDirection = FlowDirection.TopDown,
+                Padding = new Padding(0, 8, 0, 8)
+            };
+            _pLobby.Controls.Add(pnl);
+
+            // 컨트롤들
+            Label lb1 = new Label { Text = "Name", ForeColor = Color.White, AutoSize = true };
+            _tbName = new TextBox { Width = 240 };
+            Button btnApplyName = new Button { Text = "Apply Name", Width = 240 };
+            btnApplyName.Click += (s, e) =>
+            {
+                if (_online && _net != null) _net.SendSetName(_tbName.Text);
+            };
+
+            // Enter 로 즉시 적용
+            _tbName.KeyDown += (s, e) =>
+            {
+                if (e.KeyCode == Keys.Enter)
+                {
+                    if (_online && _net != null) _net.SendSetName(_tbName.Text);
+                    e.Handled = true;
+                    e.SuppressKeyPress = true;
+                }
+            };
+
+            Label lb2 = new Label { Text = "Color", ForeColor = Color.White, AutoSize = true };
+            _pColorPreview = new Panel { Width = 240, Height = 20, BackColor = ColorTranslator.FromHtml(_colorHtml) };
+            _btnPickColor = new Button { Text = "Pick Color", Width = 240 };
+            _btnPickColor.Click += (s, e) =>
+            {
+                using (ColorDialog cd = new ColorDialog())
+                {
+                    if (cd.ShowDialog() == DialogResult.OK)
+                    {
+                        _colorHtml = "#" + cd.Color.R.ToString("X2") + cd.Color.G.ToString("X2") + cd.Color.B.ToString("X2");
+                        _pColorPreview.BackColor = cd.Color;
+                        if (_online && _net != null) _net.SendSetColor(_colorHtml);
+                    }
+                }
+            };
+
+            _btnReady = new Button { Text = "READY", Width = 240, Height = 32 };
+            _btnReady.Click += (s, e) =>
+            {
+                _readyLocal = !_readyLocal;
+                _btnReady.Text = _readyLocal ? "UNREADY" : "READY";
+                if (_online && _net != null) _net.SendReady(_readyLocal);
+            };
+
+            // === 다크테마 가시성 보정 ===
+            Action<Button> StyleBtn = b =>
+            {
+                b.FlatStyle = FlatStyle.Flat;
+                b.FlatAppearance.BorderColor = Color.DimGray;
+                b.UseVisualStyleBackColor = false;
+                b.BackColor = Color.FromArgb(45, 47, 51);
+                b.ForeColor = Color.Gainsboro;
+            };
+
+            Action<TextBox> StyleTb = t =>
+            {
+                t.BorderStyle = BorderStyle.FixedSingle;
+                t.BackColor = Color.FromArgb(36, 38, 41);
+                t.ForeColor = Color.Gainsboro;
+            };
+
+            Action<Label> StyleLb = l =>
+            {
+                l.ForeColor = Color.Gainsboro;
+            };
+
+            StyleLb(lb1);
+            StyleTb(_tbName);
+            StyleBtn(btnApplyName);
+
+            StyleLb(lb2);
+            _pColorPreview.BackColor = Color.FromArgb(60, 140, 200); // 기본 미리보기 톤
+            StyleBtn(_btnPickColor);
+
+            StyleBtn(_btnReady);
+
+            // 레이아웃에 추가
+            pnl.Controls.Add(lb1);
+            pnl.Controls.Add(_tbName);
+            pnl.Controls.Add(btnApplyName);
+            pnl.Controls.Add(lb2);
+            pnl.Controls.Add(_pColorPreview);
+            pnl.Controls.Add(_btnPickColor);
+            pnl.Controls.Add(_btnReady);
+
+            // 패널 리사이즈 시 자식 폭 자동 조정 (오른쪽 짤림 방지)
+            pnl.Resize += (s, e) =>
+            {
+                int w = pnl.ClientSize.Width - SystemInformation.VerticalScrollBarWidth - 8; // 여유
+                if (w < 120) w = 120;
+                _tbName.Width = w;
+                btnApplyName.Width = w;
+                _pColorPreview.Width = w;
+                _btnPickColor.Width = w;
+                _btnReady.Width = w;
+            };
+
+            // 기본은 숨겨두고(온라인+로비일 때만 보임)
+            _pLobby.Visible = false;
+            center.Visible = false;
+
+            // Z-Order 보정
+            _pLobby.BringToFront();
+            if (_lvLobby.Parent != null) _lvLobby.Parent.BringToFront();
+        }
+
+
+        private void UpdateLobbyUI(NetLobby lobby)
+        {
+            // 우측 패널/리스트 표시 상태 토글 (로비에서만 보이게)
+            bool show = (lobby != null);
+            _pLobby.Visible = show;
+            // 리스트 담고 있는 중앙 패널은 _lvLobby.Parent (center)
+            if (_lvLobby.Parent != null) _lvLobby.Parent.Visible = show;
+
+            if (lobby == null) return;
+
+            _lvLobby.BeginUpdate();
+            _lvLobby.Items.Clear();
+            for (int i = 0; i < lobby.Players.Count; i++)
+            {
+                NetLobbyPlayer pl = lobby.Players[i];
+                ListViewItem it = new ListViewItem((i + 1).ToString());
+                string nm = string.IsNullOrEmpty(pl.Name) ? pl.Id : pl.Name;
+                if (nm.Length > 18) nm = nm.Substring(0, 18) + "…";
+                it.SubItems.Add(nm);
+                it.SubItems.Add(pl.Ready ? "READY" : "");
+                _lvLobby.Items.Add(it);
+            }
+            _lvLobby.EndUpdate();
         }
 
         // ================= 유틸: 이미지 스케일(비율 유지) =================
@@ -231,6 +425,14 @@ namespace DodgeBattleStarter
                 Step(step);
                 acc -= step;
             }
+
+            if (_online && _net != null)
+            {
+                // LOBBY 스냅샷 확인
+                NetLobby lb = _net.TryGetLobby();
+                UpdateLobbyUI(lb);
+            }
+
             Invalidate();
         }
 
@@ -485,9 +687,19 @@ namespace DodgeBattleStarter
             if (e.KeyCode == Keys.R)
             {
                 if (_online && _net != null)
-                    _net.SendRespawn();  // 투표
-                else
-                    ResetGame();         // 오프라인 리셋
+                {
+                    NetLobby lobby = _net.TryGetLobby();
+                    if (lobby != null)
+                    {
+                        // 로비면 READY 토글
+                        _btnReady.PerformClick();
+                        return;
+                    }
+                }
+
+                // 로비가 아니면 기존 동작 유지 (온라인: RESPAWN, 오프라인: Reset)
+                if (_online && _net != null) _net.SendRespawn();
+                else ResetGame();
             }
 
             if (e.KeyCode == Keys.Escape) Close();
@@ -556,6 +768,25 @@ namespace DodgeBattleStarter
         // =============== 그리기 ===============
         protected override void OnPaint(PaintEventArgs e)
         {
+            if (_online && _net != null)
+            {
+                NetLobby lobby = _net.TryGetLobby();
+                if (lobby != null)
+                {
+                    // 배경
+                    e.Graphics.Clear(Color.FromArgb(22, 24, 28));
+
+                    using (Font f = new Font("Segoe UI", 14, FontStyle.Bold))
+                    using (Brush br = new SolidBrush(Color.White))
+                    {
+                        string s = string.Format("LOBBY   Ready {0}/{1}", lobby.Ready, lobby.Need);
+                        e.Graphics.DrawString(s, f, br, 12, 12);
+                    }
+                    // 리스트/우측 패널은 컨트롤로 이미 표시되고 있으니 여기서 더 그릴 필요 없음.
+                    return;
+                }
+            }
+
             var g = e.Graphics;
             g.Clear(Color.FromArgb(22, 24, 28));
 

@@ -1,7 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
-using System.Diagnostics;
-using System.Drawing;
+using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
@@ -9,117 +8,155 @@ using System.Threading;
 
 namespace DodgeBattleStarter
 {
-    public class NetPlayer
-    {
-        public string Id;
-        public string Name;
-        public float X, Y;
-        public bool Alive;
-        public int Score;
-    }
-
-    // ★ 장애물 DTO: 서버가 주는 x,y,w,h,k를 담는다
-    public class NetObstacle
-    {
-        public float X;
-        public float Y;
-        public float W;
-        public float H;
-        public int K;   // 0=Knife, 1=Rock, 2=Fire
-    }
-
-    public class NetSnapshot
-    {
-        public int Tick;
-        public int Round = 1;
-        public string Phase = "playing"; // "playing" / "await" / "countdown"
-        public int CountdownMs = 0;
-        public int VoteCount = 0;
-        public int NeedCount = 0;
-
-        public List<NetPlayer> Players = new List<NetPlayer>();
-        public List<NetObstacle> Obstacles = new List<NetObstacle>(); // ★ 변경
-    }
-
     public class NetClient
     {
+        // ====== DTOs ======
+        public class NetPlayer { public string Id; public string Name; public float X, Y; public bool Alive; public int Score; }
+        public class NetObstacle { public float X, Y, W, H; public int K; }
+
+        public class NetSnapshot
+        {
+            public int Tick, Round;
+            public string Phase;         // "lobby" | "countdown" | "playing" | "await"
+            public int CountdownMs, VoteCount, NeedCount;
+            public List<NetPlayer> Players = new List<NetPlayer>();
+            public List<NetObstacle> Obstacles = new List<NetObstacle>();
+        }
+
+        public class NetLobbyPlayer { public string Id; public string Name; public string Color; public bool Ready; }
+        public class NetLobby
+        {
+            public List<NetLobbyPlayer> Players = new List<NetLobbyPlayer>();
+            public int Need;
+            public int Ready;
+        }
+
+        // ====== State ======
         TcpClient _tcp;
         NetworkStream _ns;
         Thread _recvThread;
         volatile bool _running;
 
-        readonly byte[] _lenBuf = new byte[4];
-        readonly byte[] _bodyBuf = new byte[64 * 1024];
-
         public string MyId { get; private set; }
-        public int Seed { get; private set; }
-        public int TickHz { get; private set; }
-        public int SnapshotHz { get; private set; }
+        int _tickHz = 60, _snapshotHz = 20;
 
-        readonly object _lock = new object();
-        NetSnapshot _latest = null;
+        readonly object _snapLock = new object();
+        NetSnapshot _snapshotLatest;
 
-        public bool Connect(string host, int port, string name)
+        readonly object _lobbyLock = new object();
+        NetLobby _lobbyLatest;
+
+        readonly byte[] _lenBuf = new byte[4];
+        readonly byte[] _bodyBuf = new byte[128 * 1024];
+
+        // ====== Public API ======
+        public bool Connect(string host, int port, string nickname)
         {
             try
             {
                 _tcp = new TcpClient();
                 _tcp.NoDelay = true;
-                _tcp.Connect(host, port);
+                _tcp.Connect(IPAddress.Parse(host), port);
                 _ns = _tcp.GetStream();
 
                 _running = true;
                 _recvThread = new Thread(RecvLoop) { IsBackground = true };
                 _recvThread.Start();
 
-                SendJson("{\"cmd\":\"JOIN\",\"name\":\"" + Escape(name) + "\"}");
+                // JOIN (닉네임 전송)
+                SendJson("{\"cmd\":\"JOIN\",\"name\":\"" + Escape(nickname) + "\"}");
                 return true;
             }
-            catch { return false; }
+            catch
+            {
+                Cleanup();
+                return false;
+            }
         }
 
         public void Close()
         {
             _running = false;
-            try { _ns.Close(); } catch { }
-            try { _tcp.Close(); } catch { }
+            Cleanup();
+        }
+
+        public NetSnapshot TryGetSnapshot()
+        {
+            lock (_snapLock) return _snapshotLatest;
+        }
+
+        public NetLobby TryGetLobby()
+        {
+            lock (_lobbyLock) return _lobbyLatest;
         }
 
         public void SendInput(bool left, bool right, bool up)
         {
-            if (_ns == null) return;
-            string json = "{"
-                + "\"cmd\":\"INPUT\","
-                + "\"left\":" + (left ? "true" : "false") + ","
-                + "\"right\":" + (right ? "true" : "false") + ","
-                + "\"up\":" + (up ? "true" : "false")
-                + "}";
-            SendJson(json);
+            SendJson("{\"cmd\":\"INPUT\",\"left\":" + (left ? "true" : "false")
+                + ",\"right\":" + (right ? "true" : "false")
+                + ",\"up\":" + (up ? "true" : "false") + "}");
         }
 
-        public void SendRespawn()
-        {
-            if (_ns == null) return;
-            SendJson("{\"cmd\":\"RESPAWN\"}");
-        }
+        public void SendRespawn() => SendJson("{\"cmd\":\"RESPAWN\"}");
 
+        public void SendSetName(string name)
+            => SendJson("{\"cmd\":\"SET_NAME\",\"name\":\"" + Escape(name) + "\"}");
+
+        public void SendSetColor(string html)
+            => SendJson("{\"cmd\":\"SET_COLOR\",\"color\":\"" + Escape(html) + "\"}");
+
+        public void SendReady(bool ready)
+            => SendJson("{\"cmd\":\"READY\",\"ready\":" + (ready ? "true" : "false") + "}");
+
+        // ====== Wire ======
         void SendJson(string json)
         {
-            byte[] body = Encoding.UTF8.GetBytes(json);
-            byte[] len = BitConverter.GetBytes(IPAddress.HostToNetworkOrder(body.Length));
             try
             {
-                _ns.Write(len, 0, len.Length);
+                if (_ns == null) return;
+                byte[] body = Encoding.UTF8.GetBytes(json);
+                byte[] len = BitConverter.GetBytes(IPAddress.HostToNetworkOrder(body.Length));
+                _ns.Write(len, 0, 4);
                 _ns.Write(body, 0, body.Length);
             }
-            catch { }
+            catch
+            {
+                // ignore
+            }
         }
 
+        string RecvJson()
+        {
+            try
+            {
+                int read = 0;
+                while (read < 4)
+                {
+                    int r = _ns.Read(_lenBuf, read, 4 - read);
+                    if (r <= 0) return null;
+                    read += r;
+                }
+                int bodyLen = IPAddress.NetworkToHostOrder(BitConverter.ToInt32(_lenBuf, 0));
+                if (bodyLen <= 0 || bodyLen > _bodyBuf.Length) return null;
+
+                int got = 0;
+                while (got < bodyLen)
+                {
+                    int r = _ns.Read(_bodyBuf, got, bodyLen - got);
+                    if (r <= 0) return null;
+                    got += r;
+                }
+                return Encoding.UTF8.GetString(_bodyBuf, 0, bodyLen);
+            }
+            catch { return null; }
+        }
+
+        // ====== Recv ======
         void RecvLoop()
         {
             try
             {
-                while (_running)
+                while (_running && _tcp != null && _tcp.Connected)
                 {
                     string json = RecvJson();
                     if (json == null) break;
@@ -127,124 +164,153 @@ namespace DodgeBattleStarter
                     if (json.IndexOf("\"cmd\":\"WELCOME\"") >= 0)
                     {
                         MyId = ExtractString(json, "id");
-                        Seed = ExtractInt(json, "seed");
-                        TickHz = ExtractInt(json, "tick_hz");
-                        SnapshotHz = ExtractInt(json, "snapshot_hz");
+                        int hz = ExtractInt(json, "tick_hz");
+                        int shz = ExtractInt(json, "snapshot_hz");
+                        if (hz > 0) _tickHz = hz;
+                        if (shz > 0) _snapshotHz = shz;
                     }
                     else if (json.IndexOf("\"cmd\":\"SNAPSHOT\"") >= 0)
                     {
-                        var snap = ParseSnapshot(json);
-                        lock (_lock) _latest = snap;
+                        // 스냅샷 파싱 + 저장, 로비 해제
+                        NetSnapshot snap = ParseSnapshot(json);
+
+                        lock (_lobbyLock) _lobbyLatest = null; // ★ 로비 종료
+                        lock (_snapLock) _snapshotLatest = snap;
                     }
+                    else if (json.IndexOf("\"cmd\":\"LOBBY\"") >= 0)
+                    {
+                        NetLobby lb = ParseLobby(json);
+                        lock (_lobbyLock) _lobbyLatest = lb;
+                    }
+                    // (그 외 cmd는 현재 없음)
                 }
             }
             catch { }
-            finally { Close(); }
-        }
-
-        string RecvJson()
-        {
-            int read = 0;
-            while (read < 4)
+            finally
             {
-                int r = _ns.Read(_lenBuf, read, 4 - read);
-                if (r <= 0) return null;
-                read += r;
+                Cleanup();
             }
-            int bodyLen = IPAddress.NetworkToHostOrder(BitConverter.ToInt32(_lenBuf, 0));
-            if (bodyLen <= 0 || bodyLen > _bodyBuf.Length) return null;
-
-            int got = 0;
-            while (got < bodyLen)
-            {
-                int r = _ns.Read(_bodyBuf, got, bodyLen - got);
-                if (r <= 0) return null;
-                got += r;
-            }
-            return Encoding.UTF8.GetString(_bodyBuf, 0, bodyLen);
         }
 
-        public NetSnapshot TryGetSnapshot()
+        void Cleanup()
         {
-            lock (_lock) return _latest;
+            try { if (_ns != null) _ns.Close(); } catch { }
+            try { if (_tcp != null) _tcp.Close(); } catch { }
+            _ns = null; _tcp = null; _running = false;
+
+            lock (_snapLock) _snapshotLatest = null;
+            lock (_lobbyLock) _lobbyLatest = null;
         }
 
-        // ===== 단순 파서 =====
-        static NetSnapshot ParseSnapshot(string json)
+        // ====== Parsers ======
+        NetSnapshot ParseSnapshot(string json)
         {
-            var snap = new NetSnapshot();
-            snap.Tick = ExtractInt(json, "tick");
-            snap.Round = ExtractInt(json, "round");
-            string phase = ExtractString(json, "phase");
-            if (!string.IsNullOrEmpty(phase)) snap.Phase = phase;
-            snap.CountdownMs = ExtractInt(json, "countdown_ms");
-            snap.VoteCount = ExtractInt(json, "vote_count");
-            snap.NeedCount = ExtractInt(json, "need_count");
+            NetSnapshot s = new NetSnapshot();
+            s.Tick = ExtractInt(json, "tick");
+            s.Round = ExtractInt(json, "round");
+            s.Phase = ExtractString(json, "phase") ?? "playing";
+            s.CountdownMs = ExtractInt(json, "countdown_ms");
+            s.VoteCount = ExtractInt(json, "vote_count");
+            s.NeedCount = ExtractInt(json, "need_count");
 
             // players
-            int pArrStart = json.IndexOf("\"players\":[");
-            if (pArrStart >= 0)
+            int pArrS = json.IndexOf("\"players\":[");
+            if (pArrS >= 0)
             {
-                int pArrEnd = json.IndexOf("]", pArrStart);
-                if (pArrEnd > pArrStart)
+                int pArrE = json.IndexOf("]", pArrS);
+                if (pArrE > pArrS)
                 {
-                    string arr = json.Substring(pArrStart, pArrEnd - pArrStart + 1);
+                    string arr = json.Substring(pArrS, pArrE - pArrS + 1);
                     int idx = 0;
                     while (true)
                     {
-                        int idStart = arr.IndexOf("\"id\":\"", idx);
-                        if (idStart < 0) break;
-                        int idEnd = arr.IndexOf("\"", idStart + 6);
-                        if (idEnd < 0) break;
-                        string id = arr.Substring(idStart + 6, idEnd - (idStart + 6));
+                        int idS = arr.IndexOf("\"id\":\"", idx);
+                        if (idS < 0) break;
+                        int idE = arr.IndexOf("\"", idS + 6);
+                        string id = arr.Substring(idS + 6, idE - (idS + 6));
 
-                        int nameStart = arr.IndexOf("\"name\":\"", idEnd);
-                        int nameEnd = (nameStart > 0) ? arr.IndexOf("\"", nameStart + 8) : -1;
-                        string name = (nameStart > 0 && nameEnd > nameStart) ? arr.Substring(nameStart + 8, nameEnd - (nameStart + 8)) : "guest";
+                        string name = ExtractStringAfter(arr, "\"name\":\"", idE);
+                        float x = ExtractFloatAfter(arr, "\"x\":", idE);
+                        float y = ExtractFloatAfter(arr, "\"y\":", idE);
+                        bool alive = ExtractBoolAfter(arr, "\"alive\":", idE);
+                        int score = ExtractIntAfter(arr, "\"score\":", idE);
 
-                        float x = ExtractFloatAfter(arr, "\"x\":", idEnd);
-                        float y = ExtractFloatAfter(arr, "\"y\":", idEnd);
-                        bool alive = ExtractBoolAfter(arr, "\"alive\":", idEnd);
-                        int score = (int)ExtractFloatAfter(arr, "\"score\":", idEnd);
+                        NetPlayer np = new NetPlayer { Id = id, Name = name, X = x, Y = y, Alive = alive, Score = score };
+                        s.Players.Add(np);
 
-                        snap.Players.Add(new NetPlayer { Id = id, Name = name, X = x, Y = y, Alive = alive, Score = score });
-                        idx = (nameEnd > 0 ? nameEnd : idEnd) + 1;
+                        int close = arr.IndexOf("}", idE);
+                        idx = (close >= 0 ? close : idE) + 1;
                     }
                 }
             }
 
-            // obstacles (x,y,w,h,k)
-            int oArrStart = json.IndexOf("\"obstacles\":[");
-            if (oArrStart >= 0)
+            // obstacles
+            int oArrS = json.IndexOf("\"obstacles\":[");
+            if (oArrS >= 0)
             {
-                int oArrEnd = json.IndexOf("]", oArrStart);
-                if (oArrEnd > oArrStart)
+                int oArrE = json.IndexOf("]", oArrS);
+                if (oArrE > oArrS)
                 {
-                    string arr = json.Substring(oArrStart, oArrEnd - oArrStart + 1);
+                    string arr = json.Substring(oArrS, oArrE - oArrS + 1);
                     int idx = 0;
                     while (true)
                     {
-                        int xPos = arr.IndexOf("\"x\":", idx);
-                        if (xPos < 0) break;
+                        int xS = arr.IndexOf("\"x\":", idx);
+                        if (xS < 0) break;
 
-                        float x = ExtractFloatAfter(arr, "\"x\":", xPos);
-                        float y = ExtractFloatAfter(arr, "\"y\":", xPos);
-                        float w = ExtractFloatAfter(arr, "\"w\":", xPos);
-                        float h = ExtractFloatAfter(arr, "\"h\":", xPos);
-                        int k = ExtractIntAfter(arr, "\"k\":", xPos);
+                        float x = ExtractFloatAfter(arr, "\"x\":", xS);
+                        float y = ExtractFloatAfter(arr, "\"y\":", xS);
+                        float w = ExtractFloatAfter(arr, "\"w\":", xS);
+                        float h = ExtractFloatAfter(arr, "\"h\":", xS);
+                        int k = ExtractIntAfter(arr, "\"k\":", xS);
 
-                        snap.Obstacles.Add(new NetObstacle { X = x, Y = y, W = w, H = h, K = k });
+                        s.Obstacles.Add(new NetObstacle { X = x, Y = y, W = w, H = h, K = k });
 
-                        // 다음 검색 시작 지점 갱신
-                        int closeObj = arr.IndexOf("}", xPos);
-                        idx = (closeObj >= 0 ? closeObj : xPos + 4) + 1;
+                        int close = arr.IndexOf("}", xS);
+                        idx = (close >= 0 ? close : xS) + 1;
                     }
                 }
             }
-            Debug.WriteLine($"[SNAP] tick={snap.Tick} players={snap.Players.Count} obstacles={snap.Obstacles.Count}");
-            return snap;
+            return s;
         }
 
+        NetLobby ParseLobby(string json)
+        {
+            NetLobby lb = new NetLobby();
+            lb.Need = ExtractInt(json, "need_count");
+            lb.Ready = ExtractInt(json, "ready_count");
+
+            int arrStart = json.IndexOf("\"players\":[");
+            if (arrStart >= 0)
+            {
+                int arrEnd = json.IndexOf("]", arrStart);
+                if (arrEnd > arrStart)
+                {
+                    string arr = json.Substring(arrStart, arrEnd - arrStart + 1);
+                    int idx = 0;
+                    while (true)
+                    {
+                        int idS = arr.IndexOf("\"id\":\"", idx);
+                        if (idS < 0) break;
+                        int idE = arr.IndexOf("\"", idS + 6);
+                        string id = arr.Substring(idS + 6, idE - (idS + 6));
+
+                        string name = ExtractStringAfter(arr, "\"name\":\"", idE);
+                        string color = ExtractStringAfter(arr, "\"color\":\"", idE);
+                        bool ready = ExtractBoolAfter(arr, "\"ready\":", idE);
+
+                        NetLobbyPlayer p = new NetLobbyPlayer { Id = id, Name = name, Color = color, Ready = ready };
+                        lb.Players.Add(p);
+
+                        int close = arr.IndexOf("}", idE);
+                        idx = (close >= 0 ? close : idE) + 1;
+                    }
+                }
+            }
+            return lb;
+        }
+
+        // ====== Helpers ======
         static string Escape(string s)
         {
             if (string.IsNullOrEmpty(s)) return "";
@@ -270,47 +336,59 @@ namespace DodgeBattleStarter
             if (i < 0) return 0;
             i = json.IndexOf(':', i);
             if (i < 0) return 0;
-            int j = i + 1;
-            while (j < json.Length && (json[j] == ' ' || json[j] == '\t')) j++;
-            int k = j;
-            while (k < json.Length && "-0123456789".IndexOf(json[k]) >= 0) k++;
-            int.TryParse(json.Substring(j, k - j), out int v);
-            return v;
+            i++;
+            while (i < json.Length && Char.IsWhiteSpace(json[i])) i++;
+            int j = i;
+            while (j < json.Length && (Char.IsDigit(json[j]) || json[j] == '-')) j++;
+            int val;
+            if (int.TryParse(json.Substring(i, j - i), NumberStyles.Integer, CultureInfo.InvariantCulture, out val))
+                return val;
+            return 0;
         }
 
-        static int ExtractIntAfter(string s, string key, int start)
+        static string ExtractStringAfter(string s, string token, int offset)
         {
-            int i = s.IndexOf(key, start);
-            if (i < 0) return 0;
-            i += key.Length;
-            while (i < s.Length && (s[i] == ' ' || s[i] == '\t')) i++;
-            int k = i;
-            while (k < s.Length && "-0123456789".IndexOf(s[k]) >= 0) k++;
-            int.TryParse(s.Substring(i, k - i), System.Globalization.NumberStyles.Integer,
-                         System.Globalization.CultureInfo.InvariantCulture, out int v);
-            return v;
+            int i = s.IndexOf(token, offset);
+            if (i < 0) return null;
+            i += token.Length;
+            int j = s.IndexOf('"', i);
+            if (j < 0) return null;
+            return s.Substring(i, j - i);
         }
 
-        static float ExtractFloatAfter(string s, string key, int start)
+        static bool ExtractBoolAfter(string s, string token, int offset)
         {
-            int i = s.IndexOf(key, start);
-            if (i < 0) return 0f;
-            i += key.Length;
-            while (i < s.Length && (s[i] == ' ' || s[i] == '\t')) i++;
-            int k = i;
-            while (k < s.Length && "-0123456789.eE".IndexOf(s[k]) >= 0) k++;
-            float.TryParse(s.Substring(i, k - i), System.Globalization.NumberStyles.Float,
-                           System.Globalization.CultureInfo.InvariantCulture, out float v);
-            return v;
-        }
-
-        static bool ExtractBoolAfter(string s, string key, int start)
-        {
-            int i = s.IndexOf(key, start);
+            int i = s.IndexOf(token, offset);
             if (i < 0) return false;
-            i += key.Length;
-            while (i < s.Length && (s[i] == ' ' || s[i] == '\t')) i++;
-            return s.IndexOf("true", i) == i;
+            i += token.Length;
+            while (i < s.Length && Char.IsWhiteSpace(s[i])) i++;
+            return s.IndexOf("true", i, StringComparison.Ordinal) == i;
+        }
+
+        static int ExtractIntAfter(string s, string token, int offset)
+        {
+            int i = s.IndexOf(token, offset);
+            if (i < 0) return 0;
+            i += token.Length;
+            while (i < s.Length && Char.IsWhiteSpace(s[i])) i++;
+            int j = i;
+            while (j < s.Length && (Char.IsDigit(s[j]) || s[j] == '-')) j++;
+            int v;
+            if (int.TryParse(s.Substring(i, j - i), NumberStyles.Integer, CultureInfo.InvariantCulture, out v)) return v;
+            return 0;
+        }
+
+        static float ExtractFloatAfter(string s, string token, int offset)
+        {
+            int i = s.IndexOf(token, offset);
+            if (i < 0) return 0f;
+            i += token.Length;
+            while (i < s.Length && Char.IsWhiteSpace(s[i])) i++;
+            int j = i;
+            while (j < s.Length && (Char.IsDigit(s[j]) || s[j] == '-' || s[j] == '+' || s[j] == '.' || s[j] == 'e' || s[j] == 'E')) j++;
+            float v;
+            if (float.TryParse(s.Substring(i, j - i), NumberStyles.Float, CultureInfo.InvariantCulture, out v)) return v;
+            return 0f;
         }
     }
 }
