@@ -26,9 +26,16 @@ namespace DodgeBattleStarter
 
         // 장애물 스프라이트
         Image _imgFire_SwordRaw, _imgFire_Sword;
-        // 불(애니메) 스프라이트 2장
         Image _imgFireRaw1, _imgFire1;
         Image _imgFireRaw2, _imgFire2;
+        Image _imgBoomRaw, _imgBoom;
+        // 폭탄(boom) 4프레임 (애니메)
+        Image[] _boomExplosionRaw = new Image[4];
+        Image[] _boomExplosion = new Image[4];
+        int _boomExplosionFrame = 0;        // 0~3
+        int _boomExplosionAnimMsAccum = 0;  // 누적 ms
+        const int BoomExplosionAnimMs = 90; // 프레임 전환 간격(ms)
+
 
         // 불 애니메이션
         int _fireFrame = 0;           // 0 or 1
@@ -122,7 +129,7 @@ namespace DodgeBattleStarter
             }
 
             // ---- 장애물 이미지 로드 ----
-            try
+            try  //fire_sword
             {
                 _imgFire_SwordRaw = Image.FromFile("Assets/fire_sword.png");
                 // 세로 긴 느낌으로 스케일
@@ -133,7 +140,17 @@ namespace DodgeBattleStarter
                 Debug.WriteLine("knife load fail: " + ex.Message);
             }
 
-            try
+            try // boom
+            {
+                _imgBoomRaw = Image.FromFile("Assets/boom.png");
+                _imgBoom = ScaleToKeepRatio(_imgBoomRaw, new Size(36, 36));
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine("boom sprite load fail: " + ex.Message);
+            }
+
+            try // fire 1, fire 2 (애니메이션)
             {
                 _imgFireRaw1 = Image.FromFile("Assets/fire_1.png");
                 _imgFireRaw2 = Image.FromFile("Assets/fire_2.png");
@@ -145,6 +162,21 @@ namespace DodgeBattleStarter
             catch (Exception ex)
             {
                 Debug.WriteLine("fire sprites load fail: " + ex.Message);
+            }
+
+            try
+            {
+                _boomExplosionRaw[0] = Image.FromFile("Assets/explosion_1.png");
+                _boomExplosionRaw[1] = Image.FromFile("Assets/explosion_2.png");
+                _boomExplosionRaw[2] = Image.FromFile("Assets/explosion_3.png");
+                _boomExplosionRaw[3] = Image.FromFile("Assets/explosion_4.png");
+
+                for (int i = 0; i < 4; i++)
+                    _boomExplosion[i] = ScaleToKeepRatio(_boomExplosionRaw[i], new Size(36, 36));
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine("boom frames load fail: " + ex.Message);
             }
         }
 
@@ -205,6 +237,14 @@ namespace DodgeBattleStarter
         // =============== 메인 업데이트 ===============
         void Step(float dt)
         {
+            // ---- 폭탄 애니메 프레임 업데이트 ----
+            _boomExplosionAnimMsAccum += (int)(dt * 1000f);
+            while (_boomExplosionAnimMsAccum >= BoomExplosionAnimMs)
+            {
+                _boomExplosionAnimMsAccum -= BoomExplosionAnimMs;
+                _boomExplosionFrame = (_boomExplosionFrame + 1) & 3;  // 0→1→2→3→0
+            }
+
             // ---- 불 애니메 프레임 업데이트 ----
             _fireAnimMsAccum += (int)(dt * 1000f);
             while (_fireAnimMsAccum >= FireAnimMs)
@@ -219,13 +259,16 @@ namespace DodgeBattleStarter
                 var snap = _net.TryGetSnapshot();
                 if (snap != null)
                 {
-                    // ---- 온라인 장애물 ----
                     _obsOnline.Clear();
                     for (int i = 0; i < snap.Obstacles.Count; i++)
                     {
                         var ob = snap.Obstacles[i];
                         _obsOnline.Add(new OnlineOb(new RectangleF(ob.X, ob.Y, ob.W, ob.H), ob.K));
                     }
+
+                    // ★ 디버그: 첫 장애물 Y 출력
+                    if (_obsOnline.Count > 0)
+                        Debug.WriteLine($"[CLIENT] firstY={_obsOnline[0].Rect.Y:F1}  count={_obsOnline.Count}");
 
                     // ---- 온라인 플레이어, 생존, 점수 ----
                     _playersOnline.Clear();
@@ -546,6 +589,27 @@ namespace DodgeBattleStarter
                             using (var b = new SolidBrush(Color.OrangeRed)) g.FillRectangle(b, r);
                         }
                     }
+                    else if (o.Kind == 1) // Boom (폭탄)
+                    {
+                        var rectB = Rectangle.Round(o.Rect);
+
+                        // 단일 폭탄 아이콘 사용
+                        Image bombIcon = _imgBoom;
+                        if (bombIcon != null)
+                        {
+                            // 살짝 크게 (취향에 맞게)
+                            float w = rectB.Width * 1.4f, h = rectB.Height * 1.4f;
+                            float x = rectB.X + (rectB.Width - w) / 2f;
+                            float y = rectB.Y + (rectB.Height - h) / 2f;
+                            g.DrawImage(bombIcon, x, y, w, h);
+                        }
+                        else
+                        {
+                            using (var b = new SolidBrush(Color.DarkSlateGray))
+                                g.FillEllipse(b, rectB);
+                        }
+                    }
+
                     else if (o.Kind == 2) // Fire
                     {
                         Image fireImg = (_fireFrame == 0 ? _imgFire1 : _imgFire2);
@@ -560,13 +624,32 @@ namespace DodgeBattleStarter
                             using (var b = new SolidBrush(Color.Lime)) g.FillRectangle(b, r); // 이미지 실패시 눈에 띄게
                         }
                     }
-                    else // Rock 등
+                    else if (o.Kind == 3) // Explosion(넉백 이펙트)
+                    {
+                        var rectB = Rectangle.Round(o.Rect);
+
+                        Image boomFx = (_boomExplosion != null && _boomExplosion[_boomExplosionFrame] != null)
+                                       ? _boomExplosion[_boomExplosionFrame]
+                                       : null;
+
+                        if (boomFx != null)
+                        {
+                            float w = rectB.Width * 1.8f, h = rectB.Height * 1.8f;
+                            float x = rectB.X + (rectB.Width - w) / 2f;
+                            float y = rectB.Y + (rectB.Height - h) / 2f;
+                            g.DrawImage(boomFx, x, y, w, h);
+                        }
+                        else
+                        {
+                            using (var b = new SolidBrush(Color.OrangeRed))
+                                g.FillEllipse(b, rectB);
+                        }
+                    }
+                    else 
                     {
                         using (var b = new SolidBrush(Color.OrangeRed)) g.FillRectangle(b, r);
                     }
-                    // (선택) 디버그: Kind 숫자 찍기
-                    using (var f = new Font("Consolas", 8))
-                         g.DrawString(o.Kind.ToString(), f, Brushes.Yellow, r.X, r.Y - 12);
+
                 }
 
 
@@ -602,9 +685,15 @@ namespace DodgeBattleStarter
                 using (var white = new SolidBrush(Color.White))
                 using (var font = new Font("Segoe UI", 10))
                 {
-                    g.DrawString("ONLINE", font, white, 12, 12);
-
                     var snapForHud = _net.TryGetSnapshot();
+                    int netTick = (snapForHud != null) ? snapForHud.Tick : -1;
+
+                    // ★ 첫 장애물 Y 디버그(스냅샷 기반)
+                    float firstY = -9999f;
+                    if (_obsOnline.Count > 0) firstY = _obsOnline[0].Rect.Y;
+
+                    g.DrawString($"ONLINE  tick={netTick}  firstY={firstY:F1}", font, white, 12, 12);
+
                     if (snapForHud != null)
                     {
                         using (var panelBg = new SolidBrush(Color.FromArgb(140, 0, 0, 0)))
@@ -820,6 +909,16 @@ namespace DodgeBattleStarter
                 _imgFire2?.Dispose();
                 _imgFireRaw1?.Dispose();
                 _imgFireRaw2?.Dispose();
+                // 폭탄 단일 이미지(사용 중이면)
+                _imgBoom?.Dispose();
+                _imgBoomRaw?.Dispose();
+
+                // 폭탄 4프레임
+                for (int i = 0; i < 4; i++)
+                {
+                    _boomExplosion[i]?.Dispose();
+                    _boomExplosionRaw[i]?.Dispose();
+                }
             }
             base.Dispose(disposing);
         }

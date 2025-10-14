@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Drawing;
 using System.Net;
 using System.Net.Sockets;
@@ -240,7 +241,7 @@ namespace DodgeBattleStarter
                     }
                 }
             }
-
+            Debug.WriteLine($"[SNAP] tick={snap.Tick} players={snap.Players.Count} obstacles={snap.Obstacles.Count}");
             return snap;
         }
 
