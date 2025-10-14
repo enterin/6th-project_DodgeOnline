@@ -16,16 +16,17 @@ namespace DodgeBattleStarter
         public bool Alive;
         public int Score;
     }
-
     public class NetSnapshot
     {
         public int Tick;
-        public string Phase = "playing";  // "playing" or "await"
+        public int Round = 1;           // ★ 라운드
+        public string Phase = "playing";
         public int VoteCount = 0;
         public int NeedCount = 0;
         public List<NetPlayer> Players = new List<NetPlayer>();
         public List<PointF> Obstacles = new List<PointF>();
     }
+
 
     public class NetClient
     {
@@ -160,6 +161,7 @@ namespace DodgeBattleStarter
         {
             var snap = new NetSnapshot();
             snap.Tick = ExtractInt(json, "tick");
+            snap.Round = ExtractInt(json, "round");
             string phase = ExtractString(json, "phase");
             if (!string.IsNullOrEmpty(phase)) snap.Phase = phase;
             snap.VoteCount = ExtractInt(json, "vote_count");

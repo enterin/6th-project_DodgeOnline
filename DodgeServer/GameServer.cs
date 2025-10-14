@@ -74,6 +74,9 @@ namespace DodgeServer
         const int SnapshotHz = 20;
         const int SpawnMs = 750;
 
+        // GameServer 클래스 필드 영역
+        int _round = 1;   // 현재 라운드(시작을 1로 가정)
+
         // ===== 월드 크기 (클라와 합의) =====
         readonly int _worldW = 900;
         readonly int _worldH = 600;
@@ -218,6 +221,7 @@ namespace DodgeServer
             finally { Disconnect(p); }
         }
 
+
         void Disconnect(Player p)
         {
             lock (_lock)
@@ -336,37 +340,6 @@ namespace DodgeServer
             }
         }
 
-        void RestartRound_Locked()
-        {
-            _respawnVotes.Clear();
-            _phase = Phase.Playing;
-
-            _obstacles.Clear();
-            _spawnAccumMs = 0;
-            _tick = 0;
-
-            // 같은 패턴 유지하려면 _seed 그대로, 새 패턴 원하면 새 시드 사용
-            _rng = new Random(_seed);
-
-            foreach (var kv in _players)
-            {
-                var p = kv.Value;
-                p.Alive = true;
-                p.VX = p.VY = 0f;
-
-                float startX = (_worldW / 2f) - 20f;
-                float groundY = _worldH - GroundMargin - 40f;
-                p.X = startX;
-                p.Y = groundY;
-
-                // 라운드 점수 초기화 원하면 활성화
-                // p.Score = 0;
-            }
-
-            Console.WriteLine("[ROUND] Restarted");
-            BroadcastSnapshot(); // 즉시 한 번 쏴서 UI 갱신 빠르게
-        }
-
         void ApplyBounds(Player p)
         {
             float left = WorldMargin;
@@ -402,10 +375,75 @@ namespace DodgeServer
             }
         }
 
+        static string Escape(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return "";
+            return s.Replace("\\", "\\\\").Replace("\"", "\\\"");
+        }
+
+        static string ExtractString(string json, string key)
+        {
+            int i = json.IndexOf("\"" + key + "\"");
+            if (i < 0) return null;
+            i = json.IndexOf(':', i);
+            if (i < 0) return null;
+            i = json.IndexOf('"', i);
+            if (i < 0) return null;
+            int j = json.IndexOf('"', i + 1);
+            if (j < 0) return null;
+            return json.Substring(i + 1, j - i - 1);
+        }
+
+        static bool ExtractBool(string json, string key)
+        {
+            int i = json.IndexOf("\"" + key + "\"");
+            if (i < 0) return false;
+            i = json.IndexOf(':', i);
+            if (i < 0) return false;
+            int j = i + 1;
+            while (j < json.Length && Char.IsWhiteSpace(json[j])) j++;
+            if (json.IndexOf("true", j) == j) return true;
+            return false;
+        }
+
+        void RestartRound_Locked()
+        {
+            _respawnVotes.Clear();
+            _phase = Phase.Playing;
+
+            _obstacles.Clear();
+            _spawnAccumMs = 0;
+            _tick = 0;
+
+            _round += 1;                // 라운드 증가 (필드에 int _round = 1; 있어야 함)
+            _rng = new Random(_seed);   // 같은 패턴 유지. 새 패턴 원하면 _seed 말고 Environment.TickCount 사용
+
+            foreach (var kv in _players)
+            {
+                var p = kv.Value;
+                p.Alive = true;
+                p.VX = 0f;
+                p.VY = 0f;
+
+                float startX = (_worldW / 2f) - 20f;          // 플레이어 크기 40x40 기준
+                float groundY = _worldH - GroundMargin - 40f; // 바닥
+                p.X = startX;
+                p.Y = groundY;
+
+                // 라운드마다 초기화 원하면 주석 해제:
+                p.Score = 0;
+            }
+
+            Console.WriteLine("[ROUND] Restarted -> Round " + _round);
+            BroadcastSnapshot(); // 즉시 1회 전송해 UI 빠르게 갱신
+        }
+
+
         void BroadcastSnapshot()
         {
             StringBuilder sb = new StringBuilder(2048);
             sb.Append("{\"cmd\":\"SNAPSHOT\",\"tick\":").Append(_tick).Append(",")
+              .Append("\"round\":").Append(_round).Append(",")
               .Append("\"phase\":\"").Append(_phase == Phase.Playing ? "playing" : "await").Append("\",")
               .Append("\"vote_count\":").Append(_respawnVotes.Count).Append(",")
               .Append("\"need_count\":").Append(_players.Count).Append(",");
@@ -446,40 +484,9 @@ namespace DodgeServer
                 foreach (var kv in _players)
                 {
                     try { Wire.SendJson(kv.Value.Ns, json); }
-                    catch { /* 끊어진 경우는 Disconnect에서 정리 */ }
+                    catch { /* 끊어진 연결은 Recv/Disconnect에서 정리 */ }
                 }
             }
-        }
-
-        static string Escape(string s)
-        {
-            if (string.IsNullOrEmpty(s)) return "";
-            return s.Replace("\\", "\\\\").Replace("\"", "\\\"");
-        }
-
-        static string ExtractString(string json, string key)
-        {
-            int i = json.IndexOf("\"" + key + "\"");
-            if (i < 0) return null;
-            i = json.IndexOf(':', i);
-            if (i < 0) return null;
-            i = json.IndexOf('"', i);
-            if (i < 0) return null;
-            int j = json.IndexOf('"', i + 1);
-            if (j < 0) return null;
-            return json.Substring(i + 1, j - i - 1);
-        }
-
-        static bool ExtractBool(string json, string key)
-        {
-            int i = json.IndexOf("\"" + key + "\"");
-            if (i < 0) return false;
-            i = json.IndexOf(':', i);
-            if (i < 0) return false;
-            int j = i + 1;
-            while (j < json.Length && Char.IsWhiteSpace(json[j])) j++;
-            if (json.IndexOf("true", j) == j) return true;
-            return false;
         }
     }
 }

@@ -309,7 +309,7 @@ namespace DodgeBattleStarter
                 using (var font = new Font("Segoe UI", 10))
                 {
                     int myScore = (_net != null && _scoreOnline.ContainsKey(_net.MyId)) ? _scoreOnline[_net.MyId] : 0;
-                    g.DrawString("ONLINE  Score: " + myScore, font, white, 12, 12);
+                    g.DrawString("ONLINE", font, white, 12, 12);
 
                     var snap = _net.TryGetSnapshot();
                     if (snap != null && snap.Phase == "await")
@@ -325,6 +325,100 @@ namespace DodgeBattleStarter
                         }
                     }
                 }
+
+                // ----- HUD: ROUND / SCOREBOARD -----
+                var snapForHud = _net.TryGetSnapshot();
+                if (snapForHud != null)
+                {
+                    // 반투명 패널 브러시
+                    using (var panelBg = new SolidBrush(Color.FromArgb(140, 0, 0, 0)))
+                    using (var white = new SolidBrush(Color.White))
+                    using (var gray = new SolidBrush(Color.Gainsboro))
+                    using (var titleFont = new Font("Segoe UI", 16, FontStyle.Bold))
+                    using (var smallFont = new Font("Segoe UI", 10, FontStyle.Regular))
+                    using (var headFont = new Font("Segoe UI", 11, FontStyle.Bold))
+                    {
+                        // 1) 상단 중앙: ROUND
+                        string roundText = "ROUND " + (snapForHud.Round > 0 ? snapForHud.Round : 1);
+                        SizeF roundSz = e.Graphics.MeasureString(roundText, titleFont);
+                        float roundX = (ClientSize.Width - roundSz.Width) / 2f;
+                        float roundY = 8f;
+
+                        // 라운드 패널 배경
+                        RectangleF roundPanel = new RectangleF(roundX - 12, roundY - 6, roundSz.Width + 24, roundSz.Height + 12);
+                        e.Graphics.FillRectangle(panelBg, roundPanel);
+                        e.Graphics.DrawString(roundText, titleFont, white, roundX, roundY);
+
+                        // 2) 우측 상단: SCOREBOARD (상위 6명)
+                        // 정렬: 점수 내림차순, 동점이면 이름
+                        var sorted = new List<NetPlayer>(snapForHud.Players);
+                        sorted.Sort(delegate (NetPlayer a, NetPlayer b)
+                        {
+                            int cmp = b.Score.CompareTo(a.Score);
+                            if (cmp != 0) return cmp;
+                            return string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase);
+                        });
+
+                        int show = Math.Min(6, sorted.Count);
+                        float sbWidth = 220f;
+                        float sbRowH = 15f;
+                        float sbHeadH = 32f;
+                        float sbX = ClientSize.Width - sbWidth - 12;
+                        float sbY = 8f;
+
+                        // 배경
+                        RectangleF sbRect = new RectangleF(sbX, sbY, sbWidth, sbHeadH + show * sbRowH + 10);
+                        e.Graphics.FillRectangle(panelBg, sbRect);
+
+                        // 헤더
+                        e.Graphics.DrawString("SCOREBOARD", headFont, white, sbX + 10, sbY + 6);
+
+                        // 컬럼 헤더(작게)
+                        float colNameX = sbX + 10;
+                        float colScoreX = sbX + sbWidth - 60;
+                        e.Graphics.DrawString("Player", smallFont, gray, colNameX, sbY + sbHeadH - 2);
+                        e.Graphics.DrawString("Score", smallFont, gray, colScoreX, sbY + sbHeadH - 2);
+
+                        // 목록
+                        for (int i = 0; i < show; i++)
+                        {
+                            var p = sorted[i];
+                            float rowY = sbY + sbHeadH + i * sbRowH + 10;
+
+                            // 내 아이디 강조
+                            bool me = (_net != null && p.Id == _net.MyId);
+                            using (var rowBrush = new SolidBrush(me ? Color.LightSkyBlue : Color.White))
+                            {
+                                // 닉네임 (너무 길면 줄임)
+                                string name = string.IsNullOrEmpty(p.Name) ? p.Id : p.Name;
+                                if (name.Length > 12) name = name.Substring(0, 12) + "…";
+
+                                e.Graphics.DrawString(name, smallFont, rowBrush, colNameX, rowY);
+                                e.Graphics.DrawString(p.Score.ToString(), smallFont, rowBrush, colScoreX, rowY);
+                            }
+                        }
+
+                        // 3) 라운드 종료 안내(투표)
+                        if (snapForHud.Phase == "await")
+                        {
+                            using (var big = new Font("Segoe UI", 18, FontStyle.Bold))
+                            {
+                                string msg = string.Format("ROUND OVER - Press R to restart  ({0}/{1})",
+                                                           snapForHud.VoteCount, snapForHud.NeedCount);
+                                SizeF sz = e.Graphics.MeasureString(msg, big);
+                                RectangleF midPanel = new RectangleF(
+                                    (ClientSize.Width - sz.Width) / 2f - 16,
+                                    (ClientSize.Height - sz.Height) / 2f - 10,
+                                    sz.Width + 32, sz.Height + 20);
+                                e.Graphics.FillRectangle(panelBg, midPanel);
+                                e.Graphics.DrawString(msg, big, white,
+                                    (ClientSize.Width - sz.Width) / 2f,
+                                    (ClientSize.Height - sz.Height) / 2f);
+                            }
+                        }
+                    }
+                }
+
                 return;
             }
 
