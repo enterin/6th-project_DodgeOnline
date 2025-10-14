@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;           // Rectangle / RectangleF
+using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
@@ -59,8 +60,6 @@ namespace DodgeServer
         public readonly byte[] BodyBuf = new byte[64 * 1024];
     }
 
-    enum Phase { Playing, AwaitingRestart }
-
     class GameServer
     {
         // ===== 게임 상수 =====
@@ -70,19 +69,32 @@ namespace DodgeServer
         const float JumpVel = 520f;
         const int WorldMargin = 24;
         const int GroundMargin = 84;
-        const int ObstacleW = 24, ObstacleH = 24;
         const int SnapshotHz = 20;
         const int SpawnMs = 750;
 
         const int PlayerW = 40;
         const int PlayerH = 40;
 
-        // GameServer 클래스 필드 영역
-        enum Phase { Countdown, Playing, AwaitingRestart }  // ★ Countdown 추가
-        int _round = 1;   // 현재 라운드(시작을 1로 가정)
+        // 라운드/카운트다운/페이즈
+        enum Phase { Countdown, Playing, AwaitingRestart }
+        int _round = 1;
         const int CountdownMs = 3000; // 3초
-        int _countdownMsLeft = 0;     // 남은 ms
-        
+        int _countdownMsLeft = 0;
+        int _roundElapsedMs = 0;      // 라운드 경과시간(ms)
+
+        // 장애물 타입
+        public enum ObKind { Knife = 0, Rock = 1, Fire = 2 }
+
+        public struct Ob
+        {
+            public RectangleF Rect;
+            public ObKind Kind;
+            public Ob(float x, float y, float w, float h, ObKind k)
+            {
+                Rect = new RectangleF(x, y, w, h);
+                Kind = k;
+            }
+        }
 
         // ===== 월드 크기 (클라와 합의) =====
         readonly int _worldW = 900;
@@ -96,7 +108,7 @@ namespace DodgeServer
 
         readonly object _lock = new object();
         readonly Dictionary<string, Player> _players = new Dictionary<string, Player>();
-        readonly List<RectangleF> _obstacles = new List<RectangleF>();
+        readonly List<Ob> _obstacles = new List<Ob>();
 
         readonly Stopwatch _sw = new Stopwatch();
         long _prevMs;
@@ -220,7 +232,6 @@ namespace DodgeServer
                                 if (_players.Count > 0 && _respawnVotes.Count >= _players.Count)
                                     RestartRound_Locked();
                             }
-                            // Playing 중엔 무시(원하면 개인 리스폰 로직을 여기 넣을 수도 있음)
                         }
                     }
                 }
@@ -228,7 +239,6 @@ namespace DodgeServer
             catch { }
             finally { Disconnect(p); }
         }
-
 
         void Disconnect(Player p)
         {
@@ -248,6 +258,100 @@ namespace DodgeServer
             }
         }
 
+        // ====== 장애물 스폰/업데이트 파라미터 ======
+
+        // 시간 경과에 따라 해금된 종류 목록을 돌려줌
+        List<ObKind> GetUnlockedKinds()
+        {
+            // 0~15s: Knife만, 15~45s: Knife+Rock, 45s~: Knife+Rock+Fire
+            if (_roundElapsedMs < 10000) return new List<ObKind> { ObKind.Knife };
+            if (_roundElapsedMs < 20000) return new List<ObKind> { ObKind.Knife, ObKind.Fire };
+            return new List<ObKind> { ObKind.Knife, ObKind.Rock, ObKind.Fire };
+        }
+
+        // 종류별 크기 (스냅샷에도 그대로 전달)
+        void GetSize(ObKind k, out float w, out float h)
+        {
+            if (k == ObKind.Knife) { w = 24; h = 24; }
+            else if (k == ObKind.Rock) { w = 30; h = 30; }
+            else { w = 20; h = 20; } // Fire
+        }
+
+        // 종류별 낙하 속도
+        float GetFallSpeed(ObKind k)
+        {
+            if (k == ObKind.Knife) return 320f;
+            if (k == ObKind.Rock) return 260f;
+            return 380f; // Fire
+        }
+
+        // 가중치로 종류 선택 (Knife 50, Rock 30, Fire 20)
+        ObKind PickKindWeighted(List<ObKind> unlocked)
+        {
+            int knifeW = 50, rockW = 30, fireW = 20;
+            var bag = new List<ObKind>();
+            foreach (var k in unlocked)
+            {
+                int w = (k == ObKind.Knife) ? knifeW : (k == ObKind.Rock ? rockW : fireW);
+                for (int i = 0; i < w; i++) bag.Add(k);
+            }
+            return bag[_rng.Next(bag.Count)];
+        }
+
+        void SpawnObstacle()
+        {
+            var unlocked = GetUnlockedKinds();
+            var kind = PickKindWeighted(unlocked);
+
+            float w, h; GetSize(kind, out w, out h);
+            int x = _rng.Next(WorldMargin, _worldW - WorldMargin - (int)w);
+            _obstacles.Add(new Ob(x, -h, w, h, kind));
+            Console.WriteLine($"[SPAWN] {kind} x={x}");
+
+        }
+
+        void UpdateObstacles(float dt)
+        {
+            for (int i = _obstacles.Count - 1; i >= 0; i--)
+            {
+                var ob = _obstacles[i];
+                var r = ob.Rect;
+                r.Y += GetFallSpeed(ob.Kind) * dt;
+                ob.Rect = r;
+                _obstacles[i] = ob;
+
+                if (r.Top > _worldH + 8)
+                {
+                    _obstacles.RemoveAt(i);
+                    // 생존 보너스: 살아있는 모든 플레이어 +5
+                    foreach (var kv in _players)
+                        if (kv.Value.Alive) kv.Value.Score += 5;
+                }
+            }
+        }
+
+        // 히트박스 축소 유틸
+        static RectangleF DeflateAroundCenter(RectangleF r, float scaleX, float scaleY)
+        {
+            if (scaleX < 0f) scaleX = 0f; if (scaleX > 1f) scaleX = 1f;
+            if (scaleY < 0f) scaleY = 0f; if (scaleY > 1f) scaleY = 1f;
+
+            float newW = r.Width * scaleX;
+            float newH = r.Height * scaleY;
+            float cx = r.X + r.Width / 2f;
+            float cy = r.Y + r.Height / 2f;
+            return new RectangleF(cx - newW / 2f, cy - newH / 2f, newW, newH);
+        }
+
+        static void GetHitScale(ObKind k, out float sx, out float sy)
+        {
+            // 칼: 가로 더 타이트, 불: 전체 타이트, 바위: 약간만
+            if (k == ObKind.Knife) { sx = 0.60f; sy = 0.70f; }
+            else if (k == ObKind.Rock) { sx = 0.85f; sy = 0.85f; }
+            else { sx = 0.65f; sy = 0.65f; } // Fire
+        }
+
+        // ===== 메인 루프 =====
         void GameLoop()
         {
             Console.WriteLine("[INFO] GameLoop started @" + TickHz + "Hz");
@@ -278,18 +382,21 @@ namespace DodgeServer
             {
                 if (_phase == Phase.Countdown)
                 {
-                    _countdownMsLeft -= (int)(dt * 1000f);
+                    _countdownMsLeft -= (int)(dt * 1000f);   //  누락된 감소 로직 추가
                     if (_countdownMsLeft <= 0)
                     {
                         _countdownMsLeft = 0;
-                        _phase = Phase.Playing;        // ★ 카운트다운 끝 → 플레이 시작
+                        _phase = Phase.Playing;
+                        _roundElapsedMs = 0;
                         Console.WriteLine("[ROUND] Round " + _round + " START");
                     }
-                    return; // ★ 카운트다운 중엔 물리/스폰/충돌 업데이트 정지
+                    return;
                 }
 
                 if (_phase == Phase.Playing)
                 {
+                    _roundElapsedMs += (int)(dt * 1000f);
+
                     // 스폰
                     _spawnAccumMs += (int)(dt * 1000);
                     while (_spawnAccumMs >= SpawnMs)
@@ -315,17 +422,18 @@ namespace DodgeServer
 
                         ApplyBounds(p);
 
-                        // === 여기부터 충돌 판정 변경 ===
-                        // 1) 플레이어 히트박스(원한다면 살짝 축소: 80%)
+                        // 플레이어 히트박스 (살짝 축소 권장)
                         var pRectRaw = new RectangleF(p.X, p.Y, PlayerW, PlayerH);
-                        var pHit = Rectangle.Round(DeflateAroundCenter(pRectRaw, 0.7f, 0.8f));  // 취향대로
+                        var pHit = Rectangle.Round(DeflateAroundCenter(pRectRaw, 0.90f, 0.90f));
 
-                        // 2) 장애물 히트박스 축소
+                        // 장애물 충돌
                         for (int i = 0; i < _obstacles.Count; i++)
                         {
-                            // _obstacles는 SpawnObstacle에서 RectangleF(x, y, ObstacleW, ObstacleH)로 넣으므로 곧바로 사용 가능
                             var obRect = _obstacles[i];
-                            var obHit = Rectangle.Round(DeflateAroundCenter(obRect, 0.7f, 0.7f));
+                            // 🔸 불일 때는 더 작게 (0.5)
+                            float scale = 0.7f;
+                            if (_obstacles[i].Kind == ObKind.Fire) scale = 0.5f;
+                            var obHit = Rectangle.Round(DeflateAroundCenter(obRect.Rect, scale, scale));
 
                             if (pHit.IntersectsWith(obHit))
                             {
@@ -333,25 +441,12 @@ namespace DodgeServer
                                 break;
                             }
                         }
-                        // === 충돌 판정 변경 끝 ===
                     }
 
-                    // 장애물 하강/소거 + 점수
-                    for (int i = _obstacles.Count - 1; i >= 0; i--)
-                    {
-                        RectangleF r = _obstacles[i];
-                        r.Y += 320f * dt;
-                        _obstacles[i] = r;
+                    // 장애물 업데이트/제거 + 생존점수는 UpdateObstacles 내부에서 처리
+                    UpdateObstacles(dt);
 
-                        if (r.Top > (_worldH + 8))
-                        {
-                            _obstacles.RemoveAt(i);
-                            foreach (var kv in _players)
-                                if (kv.Value.Alive) kv.Value.Score += 5;
-                        }
-                    }
-
-                    // 모두 사망 감지 → 투표 대기 상태로 전환
+                    // 모두 사망 감지 → 투표 대기
                     int aliveCount = 0;
                     foreach (var kv in _players)
                         if (kv.Value.Alive) aliveCount++;
@@ -365,7 +460,7 @@ namespace DodgeServer
                 }
                 else // AwaitingRestart
                 {
-                    // 월드 업데이트 정지(입력은 RecvLoop에서 계속 누적)
+                    // 월드 업데이트 정지
                 }
             }
         }
@@ -373,8 +468,8 @@ namespace DodgeServer
         void ApplyBounds(Player p)
         {
             float left = WorldMargin;
-            float right = _worldW - WorldMargin - 40;
-            float groundY = _worldH - GroundMargin - 40;
+            float right = _worldW - WorldMargin - PlayerW;
+            float groundY = _worldH - GroundMargin - PlayerH;
 
             if (p.X < left) p.X = left;
             if (p.X > right) p.X = right;
@@ -384,14 +479,8 @@ namespace DodgeServer
 
         bool IsOnGround(Player p)
         {
-            float groundY = _worldH - GroundMargin - 40;
+            float groundY = _worldH - GroundMargin - PlayerH;
             return Math.Abs(p.Y - groundY) < 0.5f;
-        }
-
-        void SpawnObstacle()
-        {
-            int x = _rng.Next(WorldMargin, _worldW - WorldMargin - ObstacleW);
-            _obstacles.Add(new RectangleF(x, -ObstacleH, ObstacleW, ObstacleH));
         }
 
         void SnapshotLoop()
@@ -403,20 +492,6 @@ namespace DodgeServer
                 Thread.Sleep(intervalMs);
                 BroadcastSnapshot();
             }
-        }
-
-        // 가운데를 기준으로 가로/세로 비율만큼 축소된 사각형 반환
-        static RectangleF DeflateAroundCenter(RectangleF r, float scaleX, float scaleY)
-        {
-            // 0~1 범위로 제한
-            if (scaleX < 0f) scaleX = 0f; if (scaleX > 1f) scaleX = 1f;
-            if (scaleY < 0f) scaleY = 0f; if (scaleY > 1f) scaleY = 1f;
-
-            float newW = r.Width * scaleX;
-            float newH = r.Height * scaleY;
-            float cx = r.X + r.Width / 2f;
-            float cy = r.Y + r.Height / 2f;
-            return new RectangleF(cx - newW / 2f, cy - newH / 2f, newW, newH);
         }
 
         static string Escape(string s)
@@ -453,15 +528,15 @@ namespace DodgeServer
         void RestartRound_Locked()
         {
             _respawnVotes.Clear();
-            _phase = Phase.Countdown;          // ★ 카운트다운 시작
-            _countdownMsLeft = CountdownMs;    // ★ 3초 세팅
+            _phase = Phase.Countdown;          // 카운트다운 시작
+            _countdownMsLeft = CountdownMs;
 
             _obstacles.Clear();
             _spawnAccumMs = 0;
             _tick = 0;
 
-            _round += 1;                // 라운드 증가 (필드에 int _round = 1; 있어야 함)
-            _rng = new Random(_seed);   // 같은 패턴 유지. 새 패턴 원하면 _seed 말고 Environment.TickCount 사용
+            _round += 1;
+            _rng = new Random(_seed);   // 같은 패턴 유지. 새 패턴 원하면 _seed 대신 Environment.TickCount
 
             foreach (var kv in _players)
             {
@@ -470,8 +545,8 @@ namespace DodgeServer
                 p.VX = 0f;
                 p.VY = 0f;
 
-                float startX = (_worldW / 2f) - 20f;          // 플레이어 크기 40x40 기준
-                float groundY = _worldH - GroundMargin - 40f; // 바닥
+                float startX = (_worldW / 2f) - (PlayerW / 2f);
+                float groundY = _worldH - GroundMargin - PlayerH;
                 p.X = startX;
                 p.Y = groundY;
 
@@ -483,19 +558,22 @@ namespace DodgeServer
             BroadcastSnapshot(); // 즉시 1회 전송해 UI 빠르게 갱신
         }
 
-
         void BroadcastSnapshot()
         {
-            StringBuilder sb = new StringBuilder(2048);
+            StringBuilder sb = new StringBuilder(4096);
             sb.Append("{\"cmd\":\"SNAPSHOT\",\"tick\":").Append(_tick).Append(",")
               .Append("\"round\":").Append(_round).Append(",")
-              .Append("\"phase\":\"").Append(_phase == Phase.Playing ? "playing" : "await").Append("\",")
+              .Append("\"phase\":\"")
+                 .Append(_phase == Phase.Playing ? "playing" :
+                         _phase == Phase.AwaitingRestart ? "await" : "countdown")
+              .Append("\",")
               .Append("\"countdown_ms\":").Append(_countdownMsLeft).Append(",")
               .Append("\"vote_count\":").Append(_respawnVotes.Count).Append(",")
               .Append("\"need_count\":").Append(_players.Count).Append(",");
 
             lock (_lock)
             {
+                // players
                 sb.Append("\"players\":[");
                 bool first = true;
                 foreach (var kv in _players)
@@ -505,22 +583,24 @@ namespace DodgeServer
                     first = false;
                     sb.Append("{\"id\":\"").Append(p.Id).Append("\",")
                       .Append("\"name\":\"").Append(Escape(p.Name)).Append("\",")
-                      .Append("\"x\":").Append(p.X.ToString(System.Globalization.CultureInfo.InvariantCulture)).Append(",")
-                      .Append("\"y\":").Append(p.Y.ToString(System.Globalization.CultureInfo.InvariantCulture)).Append(",")
+                      .Append("\"x\":").Append(p.X.ToString(CultureInfo.InvariantCulture)).Append(",")
+                      .Append("\"y\":").Append(p.Y.ToString(CultureInfo.InvariantCulture)).Append(",")
                       .Append("\"alive\":").Append(p.Alive ? "true" : "false").Append(",")
                       .Append("\"score\":").Append(p.Score).Append("}");
                 }
                 sb.Append("],");
 
+                // obstacles (x,y,w,h,k)
                 sb.Append("\"obstacles\":[");
                 for (int i = 0; i < _obstacles.Count; i++)
                 {
                     if (i > 0) sb.Append(",");
-                    var r = _obstacles[i];
-                    sb.Append("{\"x\":")
-                      .Append(r.X.ToString(System.Globalization.CultureInfo.InvariantCulture))
-                      .Append(",\"y\":")
-                      .Append(r.Y.ToString(System.Globalization.CultureInfo.InvariantCulture))
+                    var o = _obstacles[i];
+                    sb.Append("{\"x\":").Append(o.Rect.X.ToString(CultureInfo.InvariantCulture))
+                      .Append(",\"y\":").Append(o.Rect.Y.ToString(CultureInfo.InvariantCulture))
+                      .Append(",\"w\":").Append(o.Rect.Width.ToString(CultureInfo.InvariantCulture))
+                      .Append(",\"h\":").Append(o.Rect.Height.ToString(CultureInfo.InvariantCulture))
+                      .Append(",\"k\":").Append((int)o.Kind)
                       .Append("}");
                 }
                 sb.Append("]}");

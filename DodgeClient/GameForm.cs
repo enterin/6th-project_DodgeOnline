@@ -2,7 +2,7 @@
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
-using System.Linq;
+using System.Reflection;  // 리플렉션으로 스냅샷 장애물 필드 접근
 using System.Windows.Forms;
 
 namespace DodgeBattleStarter
@@ -16,15 +16,24 @@ namespace DodgeBattleStarter
         const float JumpVel = 520f;
         const int WorldMargin = 24;
         const int GroundMargin = 84;
-        const int ObstacleW = 24, ObstacleH = 24;
+        const int ObstacleW = 24, ObstacleH = 24; // 서버 기본과 일치
         const int SpawnMs = 750;
         readonly SizeF PlayerSize = new SizeF(40, 40);
 
         // 스프라이트(방향별)
         Image _imgPlayerRightRaw, _imgPlayerLeftRaw;
         Image _imgPlayerRight, _imgPlayerLeft;
-        //장애물 스프라이트
+
+        // 장애물 스프라이트
         Image _imgFire_SwordRaw, _imgFire_Sword;
+        // 불(애니메) 스프라이트 2장
+        Image _imgFireRaw1, _imgFire1;
+        Image _imgFireRaw2, _imgFire2;
+
+        // 불 애니메이션
+        int _fireFrame = 0;           // 0 or 1
+        int _fireAnimMsAccum = 0;     // 누적 ms
+        const int FireAnimMs = 120;   // 120ms마다 프레임 전환(취향대로 80~150 조절)
 
         // 로컬 플레이어 바라보는 방향 (기본: 오른쪽)
         bool _facingRight = true;
@@ -66,7 +75,15 @@ namespace DodgeBattleStarter
         int _serverPort = 5055;
         string _nickname = "player1";
 
-        List<RectangleF> _obsOnline = new List<RectangleF>();
+        // 온라인 장애물: Rect + Kind(k)
+        struct OnlineOb
+        {
+            public RectangleF Rect;
+            public int Kind; // 서버 ObKind (0=Knife, 1=Rock, 2=Fire)
+            public OnlineOb(RectangleF r, int k) { Rect = r; Kind = k; }
+        }
+        List<OnlineOb> _obsOnline = new List<OnlineOb>();
+
         Dictionary<string, RectangleF> _playersOnline = new Dictionary<string, RectangleF>();
         HashSet<string> _aliveOnline = new HashSet<string>();
         Dictionary<string, int> _scoreOnline = new Dictionary<string, int>();
@@ -90,12 +107,12 @@ namespace DodgeBattleStarter
             _sw.Start();
             _timer.Start();
 
+            // ---- 플레이어 이미지 로드 ----
             try
             {
                 _imgPlayerRightRaw = Image.FromFile("Assets/player_right.png");
                 _imgPlayerLeftRaw = Image.FromFile("Assets/player_left.png");
 
-                // 픽셀 아트 보존: 비율 유지 + 중앙 배치 스케일
                 _imgPlayerRight = ScaleToKeepRatio(_imgPlayerRightRaw, Size.Round(PlayerSize));
                 _imgPlayerLeft = ScaleToKeepRatio(_imgPlayerLeftRaw, Size.Round(PlayerSize));
             }
@@ -104,11 +121,11 @@ namespace DodgeBattleStarter
                 Debug.WriteLine("player sprite load fail: " + ex.Message);
             }
 
+            // ---- 장애물 이미지 로드 ----
             try
             {
                 _imgFire_SwordRaw = Image.FromFile("Assets/fire_sword.png");
-
-                // 세로 긴 느낌: 20x60 픽셀로 리사이즈
+                // 세로 긴 느낌으로 스케일
                 _imgFire_Sword = ScaleToKeepRatio(_imgFire_SwordRaw, new Size(20, 60));
             }
             catch (Exception ex)
@@ -116,7 +133,22 @@ namespace DodgeBattleStarter
                 Debug.WriteLine("knife load fail: " + ex.Message);
             }
 
+            try
+            {
+                _imgFireRaw1 = Image.FromFile("Assets/fire_1.png");
+                _imgFireRaw2 = Image.FromFile("Assets/fire_2.png");
+
+                // 🔸 2:3 직사각형 비율 (조금 넓게)
+                _imgFire1 = ScaleToKeepRatio(_imgFireRaw1, new Size(30, 20));
+                _imgFire2 = ScaleToKeepRatio(_imgFireRaw2, new Size(30, 20));   
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine("fire sprites load fail: " + ex.Message);
+            }
         }
+
+        // ================= 유틸: 이미지 스케일(비율 유지) =================
         static Image ScaleToKeepRatio(Image src, Size dst)
         {
             if (src == null) return null;
@@ -170,34 +202,32 @@ namespace DodgeBattleStarter
             Invalidate();
         }
 
-        // 가운데를 기준으로 가로/세로 비율만큼 축소된 사각형 반환
-        static RectangleF DeflateAroundCenter(RectangleF r, float scaleX, float scaleY)
-        {
-            // 0~1 범위로 제한
-            if (scaleX < 0f) scaleX = 0f; if (scaleX > 1f) scaleX = 1f;
-            if (scaleY < 0f) scaleY = 0f; if (scaleY > 1f) scaleY = 1f;
-
-            float newW = r.Width * scaleX;
-            float newH = r.Height * scaleY;
-            float cx = r.X + r.Width / 2f;
-            float cy = r.Y + r.Height / 2f;
-            return new RectangleF(cx - newW / 2f, cy - newH / 2f, newW, newH);
-        }
-
+        // =============== 메인 업데이트 ===============
         void Step(float dt)
         {
+            // ---- 불 애니메 프레임 업데이트 ----
+            _fireAnimMsAccum += (int)(dt * 1000f);
+            while (_fireAnimMsAccum >= FireAnimMs)
+            {
+                _fireAnimMsAccum -= FireAnimMs;
+                _fireFrame ^= 1; // 0<->1 토글
+            }
+
+            // ====== 온라인 게임 로직 ======
             if (_online && _net != null)
             {
                 var snap = _net.TryGetSnapshot();
                 if (snap != null)
                 {
+                    // ---- 온라인 장애물 ----
                     _obsOnline.Clear();
                     for (int i = 0; i < snap.Obstacles.Count; i++)
                     {
-                        var p = snap.Obstacles[i];
-                        _obsOnline.Add(new RectangleF(p.X, p.Y, ObstacleW, ObstacleH));
+                        var ob = snap.Obstacles[i];
+                        _obsOnline.Add(new OnlineOb(new RectangleF(ob.X, ob.Y, ob.W, ob.H), ob.K));
                     }
 
+                    // ---- 온라인 플레이어, 생존, 점수 ----
                     _playersOnline.Clear();
                     _aliveOnline.Clear();
                     _scoreOnline.Clear();
@@ -251,11 +281,11 @@ namespace DodgeBattleStarter
 
             if (_local.Alive)
             {
+                // 히트박스: 칼을 조금 관대하게(가로/세로 축소), 플레이어는 그대로
                 Rectangle p = Rectangle.Round(_local.Rect);
                 for (int i = 0; i < _obstacles.Count; i++)
                 {
-                    // ★ 칼(장애물) 히트박스 축소: 가로 70%, 세로 60%
-                    var hb = Rectangle.Round(DeflateAroundCenter(_obstacles[i], 0.7f, 0.7f));
+                    var hb = Rectangle.Round(DeflateAroundCenter(_obstacles[i], 0.7f, 0.6f));
                     if (p.IntersectsWith(hb))
                     {
                         _local.Alive = false;
@@ -265,6 +295,114 @@ namespace DodgeBattleStarter
             }
         }
 
+        // 가운데 기준 축소 유틸(클라 오프라인 판정용)
+        static RectangleF DeflateAroundCenter(RectangleF r, float scaleX, float scaleY)
+        {
+            if (scaleX < 0f) scaleX = 0f; if (scaleX > 1f) scaleX = 1f;
+            if (scaleY < 0f) scaleY = 0f; if (scaleY > 1f) scaleY = 1f;
+
+            float newW = r.Width * scaleX;
+            float newH = r.Height * scaleY;
+            float cx = r.X + r.Width / 2f;
+            float cy = r.Y + r.Height / 2f;
+            return new RectangleF(cx - newW / 2f, cy - newH / 2f, newW, newH);
+        }
+
+        // =============== 온라인 스냅샷 리플렉션 유틸 ===============
+        static float GetFloatMember(Type t, object o, string name, float defVal)
+        {
+            // 1) 딕셔너리 먼저
+            object dv;
+            if (TryGetFromDict(o, name, out dv))
+            {
+                try { return Convert.ToSingle(dv, System.Globalization.CultureInfo.InvariantCulture); } catch { }
+            }
+
+            // 2) 프로퍼티/필드 (대/소문자 모두 시도)
+            string[] names = { name, name.ToLowerInvariant() };
+            foreach (var nm in names)
+            {
+                var pi = t.GetProperty(nm, BindingFlags.Instance | BindingFlags.Public | BindingFlags.IgnoreCase);
+                if (pi != null)
+                {
+                    object v = pi.GetValue(o, null);
+                    if (v is IConvertible)
+                        try { return Convert.ToSingle(v, System.Globalization.CultureInfo.InvariantCulture); } catch { }
+                }
+                var fi = t.GetField(nm, BindingFlags.Instance | BindingFlags.Public | BindingFlags.IgnoreCase);
+                if (fi != null)
+                {
+                    object v = fi.GetValue(o);
+                    if (v is IConvertible)
+                        try { return Convert.ToSingle(v, System.Globalization.CultureInfo.InvariantCulture); } catch { }
+                }
+            }
+            return defVal;
+        }
+
+        static bool TryGetFromDict(object o, string key, out object val)
+        {
+            val = null;
+            // 비제네릭 IDictionary
+            var dict = o as System.Collections.IDictionary;
+            if (dict != null)
+            {
+                if (dict.Contains(key)) { val = dict[key]; return true; }
+                // 키 대소문자 변형도 시도
+                string lk = key.ToLowerInvariant(), uk = key.ToUpperInvariant();
+                foreach (var k in dict.Keys)
+                {
+                    if (k is string ks &&
+                        (ks == key || ks == lk || ks == uk))
+                    { val = dict[k]; return true; }
+                }
+                return false;
+            }
+
+            // 제네릭 IDictionary<string, object>
+            var gen = o as IDictionary<string, object>;
+            if (gen != null)
+            {
+                object tmp;
+                if (gen.TryGetValue(key, out tmp)) { val = tmp; return true; }
+                if (gen.TryGetValue(key.ToLowerInvariant(), out tmp)) { val = tmp; return true; }
+                if (gen.TryGetValue(key.ToUpperInvariant(), out tmp)) { val = tmp; return true; }
+            }
+            return false;
+        }
+
+        static int GetIntMember(Type t, object o, string name, int defVal)
+        {
+            // 1) 딕셔너리 먼저
+            object dv;
+            if (TryGetFromDict(o, name, out dv))
+            {
+                try { return Convert.ToInt32(dv, System.Globalization.CultureInfo.InvariantCulture); } catch { }
+            }
+
+            // 2) 프로퍼티/필드 (대/소문자 모두 시도)
+            string[] names = { name, name.ToLowerInvariant() };
+            foreach (var nm in names)
+            {
+                var pi = t.GetProperty(nm, BindingFlags.Instance | BindingFlags.Public | BindingFlags.IgnoreCase);
+                if (pi != null)
+                {
+                    object v = pi.GetValue(o, null);
+                    if (v is IConvertible)
+                        try { return Convert.ToInt32(v, System.Globalization.CultureInfo.InvariantCulture); } catch { }
+                }
+                var fi = t.GetField(nm, BindingFlags.Instance | BindingFlags.Public | BindingFlags.IgnoreCase);
+                if (fi != null)
+                {
+                    object v = fi.GetValue(o);
+                    if (v is IConvertible)
+                        try { return Convert.ToInt32(v, System.Globalization.CultureInfo.InvariantCulture); } catch { }
+                }
+            }
+            return defVal;
+        }
+
+        // =============== 경계/땅/스폰 ===============
         void ApplyBounds(Player p)
         {
             float left = WorldMargin;
@@ -280,19 +418,18 @@ namespace DodgeBattleStarter
                 p.vy = 0f;
             }
         }
-
         bool IsOnGround(Player p)
         {
             float groundY = ClientSize.Height - GroundMargin - p.Rect.Height;
             return Math.Abs(p.Rect.Y - groundY) < 0.5f;
         }
-
         void SpawnObstacle()
         {
             int x = _rng.Next(WorldMargin, ClientSize.Width - WorldMargin - ObstacleW);
             _obstacles.Add(new RectangleF(x, -ObstacleH, ObstacleW, ObstacleH));
         }
 
+        // =============== 입력 처리 ===============
         void OnKeyDown(object s, KeyEventArgs e)
         {
             if (e.KeyCode == Keys.Left || e.KeyCode == Keys.A) { _local.Left = true; _facingRight = false; }
@@ -345,6 +482,8 @@ namespace DodgeBattleStarter
             };
             _remotes.Clear();
         }
+
+        // =============== 플레이어 렌더 ===============
         void DrawPlayerSprite(Graphics g, RectangleF rect, bool alive, bool highlight, bool facingRight)
         {
             var r = Rectangle.Round(rect);
@@ -369,9 +508,9 @@ namespace DodgeBattleStarter
                     g.FillRectangle(br, r);
                 }
             }
-
         }
 
+        // =============== 그리기 ===============
         protected override void OnPaint(PaintEventArgs e)
         {
             var g = e.Graphics;
@@ -387,46 +526,66 @@ namespace DodgeBattleStarter
 
             if (_online)
             {
-                if (_imgFire_Sword != null)
+                // ---- 온라인 장애물 렌더 (종류별로 개별 판단) ----
+                for (int i = 0; i < _obsOnline.Count; i++)
                 {
-                    for (int i = 0; i < _obsOnline.Count; i++)
+                    var o = _obsOnline[i];
+                    var r = Rectangle.Round(o.Rect);
+
+                    if (o.Kind == 0) // Knife
                     {
-                        var r = Rectangle.Round(_obsOnline[i]);
-
-                        // 세로로 긴 칼 느낌 (가로 0.8배, 세로 2.5배)
-                        float w = r.Width * 0.8f;
-                        float h = r.Height * 2.5f;
-                        float x = r.X + (r.Width - w) / 2f;
-                        float y = r.Y - (h - r.Height) / 2f;
-
-                        g.DrawImage(_imgFire_Sword, x, y, w, h);
+                        if (_imgFire_Sword != null)
+                        {
+                            float w = r.Width * 0.8f, h = r.Height * 2.5f;
+                            float x = r.X + (r.Width - w) / 2f;
+                            float y = r.Y - (h - r.Height) / 2f;
+                            g.DrawImage(_imgFire_Sword, x, y, w, h);
+                        }
+                        else
+                        {
+                            using (var b = new SolidBrush(Color.OrangeRed)) g.FillRectangle(b, r);
+                        }
                     }
-                }
-                else
-                {
-                    using (var obs = new SolidBrush(Color.OrangeRed))
+                    else if (o.Kind == 2) // Fire
                     {
-                        for (int i = 0; i < _obsOnline.Count; i++)
-                            g.FillRectangle(obs, Rectangle.Round(_obsOnline[i]));
+                        Image fireImg = (_fireFrame == 0 ? _imgFire1 : _imgFire2);
+                        if (fireImg != null)
+                        {
+                            float w = r.Width * 1.5f, h = r.Height;    // 2:3 느낌
+                            float x = r.X + (r.Width - w) / 2f, y = r.Y;
+                            g.DrawImage(fireImg, x, y, w, h);
+                        }
+                        else
+                        {
+                            using (var b = new SolidBrush(Color.Lime)) g.FillRectangle(b, r); // 이미지 실패시 눈에 띄게
+                        }
                     }
+                    else // Rock 등
+                    {
+                        using (var b = new SolidBrush(Color.OrangeRed)) g.FillRectangle(b, r);
+                    }
+                    // (선택) 디버그: Kind 숫자 찍기
+                    using (var f = new Font("Consolas", 8))
+                         g.DrawString(o.Kind.ToString(), f, Brushes.Yellow, r.X, r.Y - 12);
                 }
 
+
+                // ---- 온라인 플레이어 렌더 ----
                 foreach (var kv in _playersOnline)
                 {
                     var id = kv.Key;
                     var rect = kv.Value;
 
-                    // 기본값 유지
                     bool faceRight = true;
                     bool prevKnown = _prevRectOnline.TryGetValue(id, out var prevRect);
 
                     if (prevKnown)
                     {
                         float dx = rect.X - prevRect.X;
-                        if (Math.Abs(dx) > 0.5f) // 작은 흔들림 무시
+                        if (Math.Abs(dx) > 0.5f)
                             faceRight = dx >= 0;
                         else if (_facingRightOnline.TryGetValue(id, out var prevDir))
-                            faceRight = prevDir; // 정지 중엔 이전 방향 유지
+                            faceRight = prevDir;
                     }
 
                     _prevRectOnline[id] = rect;
@@ -434,222 +593,193 @@ namespace DodgeBattleStarter
 
                     bool alive = _aliveOnline.Contains(id);
                     bool me = (_net != null && id == _net.MyId);
-
-                    // 내 캐릭터는 로컬 입력 기준으로 확정
                     if (me) faceRight = _facingRight;
 
                     DrawPlayerSprite(e.Graphics, rect, alive, highlight: me, facingRight: faceRight);
                 }
 
-
+                // ---- 상단 작은 텍스트 + 라운드/스코어보드/HUD ----
                 using (var white = new SolidBrush(Color.White))
                 using (var font = new Font("Segoe UI", 10))
                 {
-                    int myScore = (_net != null && _scoreOnline.ContainsKey(_net.MyId)) ? _scoreOnline[_net.MyId] : 0;
                     g.DrawString("ONLINE", font, white, 12, 12);
 
-                    var snap = _net.TryGetSnapshot();
-                    if (snap != null && snap.Phase == "await")
+                    var snapForHud = _net.TryGetSnapshot();
+                    if (snapForHud != null)
                     {
-                        using (var big = new Font("Segoe UI", 18, FontStyle.Bold))
+                        using (var panelBg = new SolidBrush(Color.FromArgb(140, 0, 0, 0)))
+                        using (var gray = new SolidBrush(Color.Gainsboro))
+                        using (var titleFont = new Font("Segoe UI", 16, FontStyle.Bold))
+                        using (var smallFont = new Font("Segoe UI", 10, FontStyle.Regular))
+                        using (var headFont = new Font("Segoe UI", 11, FontStyle.Bold))
                         {
-                            string msg = string.Format("ROUND OVER - Press R to restart  ({0}/{1})",
-                                                       snap.VoteCount, snap.NeedCount);
-                            SizeF sz = g.MeasureString(msg, big);
-                            g.DrawString(msg, big, white,
-                                (ClientSize.Width - sz.Width) / 2f,
-                                (ClientSize.Height - sz.Height) / 2f);
+                            // 1) 라운드
+                            string roundText = "ROUND " + (snapForHud.Round > 0 ? snapForHud.Round : 1);
+                            SizeF roundSz = e.Graphics.MeasureString(roundText, titleFont);
+                            float roundX = (ClientSize.Width - roundSz.Width) / 2f;
+                            float roundY = 8f;
+
+                            RectangleF roundPanel = new RectangleF(roundX - 12, roundY - 6, roundSz.Width + 24, roundSz.Height + 12);
+                            e.Graphics.FillRectangle(panelBg, roundPanel);
+                            e.Graphics.DrawString(roundText, titleFont, Brushes.White, roundX, roundY);
+
+                            // 2) 스코어보드
+                            var sorted = new List<NetPlayer>(snapForHud.Players);
+                            sorted.Sort(delegate (NetPlayer a, NetPlayer b)
+                            {
+                                int cmp = b.Score.CompareTo(a.Score);
+                                if (cmp != 0) return cmp;
+                                return string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase);
+                            });
+
+                            int show = Math.Min(6, sorted.Count);
+                            float sbWidth = 220f;
+                            float sbRowH = 15f;
+                            float sbHeadH = 28f;
+                            float sbX = ClientSize.Width - sbWidth - 12;
+                            float sbY = 8f;
+
+                            RectangleF sbRect = new RectangleF(sbX, sbY, sbWidth, sbHeadH + show * sbRowH + 12);
+                            e.Graphics.FillRectangle(panelBg, sbRect);
+
+                            e.Graphics.DrawString("SCORE BOARD", headFont, Brushes.White, sbX + 10, sbY + 6);
+
+                            float colNameX = sbX + 10;
+                            float colScoreX = sbX + sbWidth - 60;
+                            e.Graphics.DrawString("Player", smallFont, gray, colNameX, sbY + sbHeadH + 2);
+                            e.Graphics.DrawString("Score", smallFont, gray, colScoreX, sbY + sbHeadH + 2);
+
+                            float rowStartY = sbY + sbHeadH + 16f;
+                            for (int i = 0; i < show; i++)
+                            {
+                                var p = sorted[i];
+                                float rowY = rowStartY + (i * sbRowH);
+
+                                Color bgColor =
+                                    (i == 0) ? Color.FromArgb(60, 255, 215, 0) :
+                                    (i == 1) ? Color.FromArgb(50, 192, 192, 192) :
+                                    (i == 2) ? Color.FromArgb(50, 205, 127, 50) :
+                                               Color.FromArgb(0, 0, 0, 0);
+                                if (bgColor.A > 0)
+                                {
+                                    using (var rankBg = new SolidBrush(bgColor))
+                                        e.Graphics.FillRectangle(rankBg, new RectangleF(sbX + 4, rowY - 2, sbWidth - 8, sbRowH + 2));
+                                }
+
+                                bool me = (_net != null && p.Id == _net.MyId);
+                                Brush rowBrush = me
+                                    ? (Brush)new SolidBrush(Color.LightSkyBlue)
+                                    : (p.Alive ? (Brush)new SolidBrush(Color.White) : (Brush)new SolidBrush(Color.Gray));
+
+                                string name = string.IsNullOrEmpty(p.Name) ? p.Id : p.Name;
+                                if (name.Length > 12) name = name.Substring(0, 12) + "…";
+
+                                float badgeW = 18f;
+                                float badgeH = sbRowH + 2;
+                                float badgeX = sbX + 6;
+                                float badgeY = rowY - 2;
+
+                                using (var badgeBrush = new SolidBrush(Color.FromArgb(200, 0, 0, 0)))
+                                using (var badgePen = new Pen(Color.DimGray, 1))
+                                using (var rankFont = new Font("Segoe UI", 9, FontStyle.Bold))
+                                {
+                                    e.Graphics.FillRectangle(badgeBrush, badgeX, badgeY, badgeW, badgeH);
+                                    e.Graphics.DrawRectangle(badgePen, badgeX, badgeY, badgeW, badgeH);
+
+                                    string rankStr = (i + 1).ToString();
+                                    var sz = e.Graphics.MeasureString(rankStr, rankFont);
+                                    e.Graphics.DrawString(rankStr, rankFont, Brushes.White,
+                                        badgeX + (badgeW - sz.Width) / 2f,
+                                        badgeY + (badgeH - sz.Height) / 2f);
+                                }
+
+                                float namePad = 12f;
+                                float nameX = badgeX + badgeW + namePad;
+                                float scoreX = colScoreX;
+
+                                using (rowBrush)
+                                using (var textFont = new Font("Segoe UI", 10, me ? FontStyle.Bold : FontStyle.Regular))
+                                {
+                                    e.Graphics.DrawString(name, textFont, rowBrush, nameX, rowY);
+                                    e.Graphics.DrawString(p.Score.ToString(), textFont, rowBrush, scoreX, rowY);
+                                }
+                            }
+
+                            // 3) 중앙 오버레이(카운트다운/투표)
+                            if (snapForHud.Phase == "countdown")
+                            {
+                                int sec = (snapForHud.CountdownMs + 999) / 1000;
+                                string msg = (sec > 0) ? sec.ToString() : "START!";
+                                using (var big = new Font("Segoe UI", 28, FontStyle.Bold))
+                                {
+                                    SizeF sz = e.Graphics.MeasureString(msg, big);
+                                    RectangleF mid = new RectangleF(
+                                        (ClientSize.Width - sz.Width) / 2f - 20,
+                                        (ClientSize.Height - sz.Height) / 2f - 12,
+                                        sz.Width + 40, sz.Height + 24);
+                                    e.Graphics.FillRectangle(panelBg, mid);
+                                    e.Graphics.DrawString(msg, big, Brushes.White,
+                                        (ClientSize.Width - sz.Width) / 2f,
+                                        (ClientSize.Height - sz.Height) / 2f);
+                                }
+                            }
+                            else if (snapForHud.Phase == "await")
+                            {
+                                using (var big = new Font("Segoe UI", 18, FontStyle.Bold))
+                                {
+                                    string msg = string.Format("ROUND OVER - Press R to restart  ({0}/{1})",
+                                                               snapForHud.VoteCount, snapForHud.NeedCount);
+                                    SizeF sz = e.Graphics.MeasureString(msg, big);
+                                    RectangleF midPanel = new RectangleF(
+                                        (ClientSize.Width - sz.Width) / 2f - 16,
+                                        (ClientSize.Height - sz.Height) / 2f - 10,
+                                        sz.Width + 32, sz.Height + 20);
+                                    e.Graphics.FillRectangle(panelBg, midPanel);
+                                    e.Graphics.DrawString(msg, big, Brushes.White,
+                                        (ClientSize.Width - sz.Width) / 2f,
+                                        (ClientSize.Height - sz.Height) / 2f);
+                                }
+                            }
                         }
                     }
                 }
 
-                // ----- HUD: ROUND / SCOREBOARD -----
-                var snapForHud = _net.TryGetSnapshot();
-                if (snapForHud != null)
-                {
-                    using (var panelBg = new SolidBrush(Color.FromArgb(140, 0, 0, 0)))
-                    using (var white = new SolidBrush(Color.White))
-                    using (var gray = new SolidBrush(Color.Gainsboro))
-                    using (var titleFont = new Font("Segoe UI", 16, FontStyle.Bold))
-                    using (var smallFont = new Font("Segoe UI", 10, FontStyle.Regular))
-                    using (var headFont = new Font("Segoe UI", 11, FontStyle.Bold))
-                    {
-                        // 1) 상단 중앙: ROUND
-                        string roundText = "ROUND " + (snapForHud.Round > 0 ? snapForHud.Round : 1);
-                        SizeF roundSz = e.Graphics.MeasureString(roundText, titleFont);
-                        float roundX = (ClientSize.Width - roundSz.Width) / 2f;
-                        float roundY = 8f;
-
-                        RectangleF roundPanel = new RectangleF(roundX - 12, roundY - 6, roundSz.Width + 24, roundSz.Height + 12);
-                        e.Graphics.FillRectangle(panelBg, roundPanel);
-                        e.Graphics.DrawString(roundText, titleFont, white, roundX, roundY);
-
-                        // 2) 우측 상단: SCOREBOARD
-                        var sorted = new List<NetPlayer>(snapForHud.Players);
-                        sorted.Sort(delegate (NetPlayer a, NetPlayer b)
-                        {
-                            int cmp = b.Score.CompareTo(a.Score);
-                            if (cmp != 0) return cmp;
-                            return string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase);
-                        });
-
-                        int show = Math.Min(6, sorted.Count);
-                        float sbWidth = 220f;
-                        float sbRowH = 15f;           // 촘촘한 행 간격
-                        float sbHeadH = 28f;           // 헤더 높이
-                        float sbX = ClientSize.Width - sbWidth - 12;
-                        float sbY = 8f;
-
-                        // 패널 배경
-                        RectangleF sbRect = new RectangleF(sbX, sbY, sbWidth, sbHeadH + show * sbRowH + 12);
-                        e.Graphics.FillRectangle(panelBg, sbRect);
-
-                        // 헤더
-                        e.Graphics.DrawString("SCORE BOARD", headFont, white, sbX + 10, sbY + 6);
-
-                        // 컬럼 헤더
-                        float colNameX = sbX + 10;            // 헤더용 최초 위치
-                        float colScoreX = sbX + sbWidth - 60;
-                        e.Graphics.DrawString("Player", smallFont, gray, colNameX, sbY + sbHeadH + 2);
-                        e.Graphics.DrawString("Score", smallFont, gray, colScoreX, sbY + sbHeadH + 2);
-
-                        // 목록 (★ 겹침 방지: 첫 행 시작 Y를 확 내려줌)
-                        float rowStartY = sbY + sbHeadH + 16f; // 헤더 아래 여백
-                        for (int i = 0; i < show; i++)
-                        {
-                            var p = sorted[i];
-                            float rowY = rowStartY + (i * sbRowH);
-
-                            // 랭크 배경(메달색)
-                            Color bgColor =
-                                (i == 0) ? Color.FromArgb(60, 255, 215, 0) :
-                                (i == 1) ? Color.FromArgb(50, 192, 192, 192) :
-                                (i == 2) ? Color.FromArgb(50, 205, 127, 50) :
-                                           Color.FromArgb(0, 0, 0, 0);
-                            if (bgColor.A > 0)
-                            {
-                                using (var rankBg = new SolidBrush(bgColor))
-                                    e.Graphics.FillRectangle(rankBg, new RectangleF(sbX + 4, rowY - 2, sbWidth - 8, sbRowH + 2));
-                            }
-
-                            // 이름 색상: 나(하늘색 Bold) / 생존(흰색) / 사망(회색)
-                            bool me = (_net != null && p.Id == _net.MyId);
-                            Brush rowBrush = me
-                                ? (Brush)new SolidBrush(Color.LightSkyBlue)
-                                : (p.Alive ? (Brush)new SolidBrush(Color.White) : (Brush)new SolidBrush(Color.Gray));
-
-                            // 닉네임 축약
-                            string name = string.IsNullOrEmpty(p.Name) ? p.Id : p.Name;
-                            if (name.Length > 12) name = name.Substring(0, 12) + "…";
-
-                            // ── 랭크 뱃지(숫자)
-                            float badgeW = 18f;
-                            float badgeH = sbRowH + 2;
-                            float badgeX = sbX + 6;
-                            float badgeY = rowY - 2;
-
-                            using (var badgeBrush = new SolidBrush(Color.FromArgb(200, 0, 0, 0)))
-                            using (var badgePen = new Pen(Color.DimGray, 1))
-                            using (var rankFont = new Font("Segoe UI", 9, FontStyle.Bold))
-                            {
-                                e.Graphics.FillRectangle(badgeBrush, badgeX, badgeY, badgeW, badgeH);
-                                e.Graphics.DrawRectangle(badgePen, badgeX, badgeY, badgeW, badgeH);
-
-                                string rankStr = (i + 1).ToString();
-                                var sz = e.Graphics.MeasureString(rankStr, rankFont);
-                                e.Graphics.DrawString(rankStr, rankFont, Brushes.White,
-                                    badgeX + (badgeW - sz.Width) / 2f,
-                                    badgeY + (badgeH - sz.Height) / 2f);
-                            }
-
-                            // 이름/점수 X 위치 (★ 이름은 뱃지 오른쪽으로 충분히 밀기)
-                            float namePad = 12f;
-                            float nameX = badgeX + badgeW + namePad;   // ← 여기서부터 이름
-                            float scoreX = colScoreX;
-
-                            // 이름/점수 그리기
-                            using (rowBrush)
-                            using (var textFont = new Font("Segoe UI", 10, me ? FontStyle.Bold : FontStyle.Regular))
-                            {
-                                e.Graphics.DrawString(name, textFont, rowBrush, nameX, rowY);
-                                e.Graphics.DrawString(p.Score.ToString(), textFont, rowBrush, scoreX, rowY);
-                            }
-                        }
-
-                        // 3) 중앙 오버레이: 카운트다운 또는 투표 안내  (★ panelBg/white 재사용)
-                        if (snapForHud.Phase == "countdown")
-                        {
-                            int sec = (snapForHud.CountdownMs + 999) / 1000;
-                            string msg = (sec > 0) ? sec.ToString() : "START!";
-                            using (var big = new Font("Segoe UI", 28, FontStyle.Bold))
-                            {
-                                SizeF sz = e.Graphics.MeasureString(msg, big);
-                                RectangleF mid = new RectangleF(
-                                    (ClientSize.Width - sz.Width) / 2f - 20,
-                                    (ClientSize.Height - sz.Height) / 2f - 12,
-                                    sz.Width + 40, sz.Height + 24);
-                                e.Graphics.FillRectangle(panelBg, mid);
-                                e.Graphics.DrawString(msg, big, white,
-                                    (ClientSize.Width - sz.Width) / 2f,
-                                    (ClientSize.Height - sz.Height) / 2f);
-                            }
-                        }
-                        else if (snapForHud.Phase == "await")
-                        {
-                            using (var big = new Font("Segoe UI", 18, FontStyle.Bold))
-                            {
-                                string msg = string.Format("ROUND OVER - Press R to restart  ({0}/{1})",
-                                                           snapForHud.VoteCount, snapForHud.NeedCount);
-                                SizeF sz = e.Graphics.MeasureString(msg, big);
-                                RectangleF midPanel = new RectangleF(
-                                    (ClientSize.Width - sz.Width) / 2f - 16,
-                                    (ClientSize.Height - sz.Height) / 2f - 10,
-                                    sz.Width + 32, sz.Height + 20);
-                                e.Graphics.FillRectangle(panelBg, midPanel);
-                                e.Graphics.DrawString(msg, big, white,
-                                    (ClientSize.Width - sz.Width) / 2f,
-                                    (ClientSize.Height - sz.Height) / 2f);
-                            }
-                        }
-                    }
-                }
-                return;
+                return; // 온라인 렌더 끝
             }
 
             // ====== 오프라인 렌더링 ======
-            foreach (var obs in _obstacles)
+            // 장애물: 칼 이미지로 세로 길게, 폴백은 사각형
+            if (_imgFire_Sword != null)
             {
-                if (_imgFire_Sword != null)
+                foreach (var obs in _obstacles)
                 {
                     var r = Rectangle.Round(obs);
-                    // 가로는 약간 좁게, 세로는 길게
                     float w = r.Width * 0.8f;
-                    float h = r.Height * 2.5f;
+                    float h = r.Height * 2.5f;  // 세로 길게
                     float x = r.X + (r.Width - w) / 2f;
                     float y = r.Y - (h - r.Height) / 2f;
-
                     g.DrawImage(_imgFire_Sword, x, y, w, h);
                 }
-                else
+            }
+            else
+            {
+                using (var obs2 = new SolidBrush(Color.OrangeRed))
                 {
-                    // 이미지가 없으면 기존처럼 사각형으로 표시
-                    using (var obs2 = new SolidBrush(Color.OrangeRed))
-                    {
-                        g.FillRectangle(obs2, Rectangle.Round(obs));
-                    }
+                    for (int i = 0; i < _obstacles.Count; i++)
+                        g.FillRectangle(obs2, Rectangle.Round(_obstacles[i]));
                 }
             }
 
-
+            // 플레이어
             DrawPlayerSprite(e.Graphics, _local.Rect, _local.Alive, highlight: true, facingRight: _facingRight);
             foreach (var kv in _remotes)
             {
                 var p = kv.Value;
-                // 간단히: 로컬 기준과 동일 논리(왼/오 입력 상태로 추정) 또는 p.vx>0 여부 이용 가능
-                bool facingRight = p.vx >= 0; // 오프라인 봇용
+                bool facingRight = p.vx >= 0;
                 DrawPlayerSprite(e.Graphics, p.Rect, p.Alive, highlight: false, facingRight: facingRight);
             }
 
+            // 간단 HUD(오프라인)
             using (var white2 = new SolidBrush(Color.White))
             using (var font2 = new Font("Segoe UI", 10, FontStyle.Regular))
             {
@@ -682,6 +812,14 @@ namespace DodgeBattleStarter
                 _imgPlayerLeft?.Dispose();
                 _imgPlayerRightRaw?.Dispose();
                 _imgPlayerLeftRaw?.Dispose();
+
+                _imgFire_Sword?.Dispose();
+                _imgFire_SwordRaw?.Dispose();
+
+                _imgFire1?.Dispose();
+                _imgFire2?.Dispose();
+                _imgFireRaw1?.Dispose();
+                _imgFireRaw2?.Dispose();
             }
             base.Dispose(disposing);
         }

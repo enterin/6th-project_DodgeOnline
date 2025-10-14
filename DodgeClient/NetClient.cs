@@ -16,18 +16,29 @@ namespace DodgeBattleStarter
         public bool Alive;
         public int Score;
     }
+
+    // ★ 장애물 DTO: 서버가 주는 x,y,w,h,k를 담는다
+    public class NetObstacle
+    {
+        public float X;
+        public float Y;
+        public float W;
+        public float H;
+        public int K;   // 0=Knife, 1=Rock, 2=Fire
+    }
+
     public class NetSnapshot
     {
         public int Tick;
         public int Round = 1;
         public string Phase = "playing"; // "playing" / "await" / "countdown"
-        public int CountdownMs = 0;      // ★ 남은 ms
+        public int CountdownMs = 0;
         public int VoteCount = 0;
         public int NeedCount = 0;
-        public List<NetPlayer> Players = new List<NetPlayer>();
-        public List<PointF> Obstacles = new List<PointF>();
-    }
 
+        public List<NetPlayer> Players = new List<NetPlayer>();
+        public List<NetObstacle> Obstacles = new List<NetObstacle>(); // ★ 변경
+    }
 
     public class NetClient
     {
@@ -157,7 +168,7 @@ namespace DodgeBattleStarter
             lock (_lock) return _latest;
         }
 
-        // ===== 파서 =====
+        // ===== 단순 파서 =====
         static NetSnapshot ParseSnapshot(string json)
         {
             var snap = new NetSnapshot();
@@ -169,6 +180,7 @@ namespace DodgeBattleStarter
             snap.VoteCount = ExtractInt(json, "vote_count");
             snap.NeedCount = ExtractInt(json, "need_count");
 
+            // players
             int pArrStart = json.IndexOf("\"players\":[");
             if (pArrStart >= 0)
             {
@@ -182,23 +194,25 @@ namespace DodgeBattleStarter
                         int idStart = arr.IndexOf("\"id\":\"", idx);
                         if (idStart < 0) break;
                         int idEnd = arr.IndexOf("\"", idStart + 6);
+                        if (idEnd < 0) break;
                         string id = arr.Substring(idStart + 6, idEnd - (idStart + 6));
 
                         int nameStart = arr.IndexOf("\"name\":\"", idEnd);
-                        int nameEnd = arr.IndexOf("\"", nameStart + 8);
+                        int nameEnd = (nameStart > 0) ? arr.IndexOf("\"", nameStart + 8) : -1;
                         string name = (nameStart > 0 && nameEnd > nameStart) ? arr.Substring(nameStart + 8, nameEnd - (nameStart + 8)) : "guest";
 
-                        float x = ExtractFloatAfter(arr, "\"x\":", nameEnd);
-                        float y = ExtractFloatAfter(arr, "\"y\":", nameEnd);
-                        bool alive = ExtractBoolAfter(arr, "\"alive\":", nameEnd);
-                        int score = (int)ExtractFloatAfter(arr, "\"score\":", nameEnd);
+                        float x = ExtractFloatAfter(arr, "\"x\":", idEnd);
+                        float y = ExtractFloatAfter(arr, "\"y\":", idEnd);
+                        bool alive = ExtractBoolAfter(arr, "\"alive\":", idEnd);
+                        int score = (int)ExtractFloatAfter(arr, "\"score\":", idEnd);
 
                         snap.Players.Add(new NetPlayer { Id = id, Name = name, X = x, Y = y, Alive = alive, Score = score });
-                        idx = nameEnd + 1;
+                        idx = (nameEnd > 0 ? nameEnd : idEnd) + 1;
                     }
                 }
             }
 
+            // obstacles (x,y,w,h,k)
             int oArrStart = json.IndexOf("\"obstacles\":[");
             if (oArrStart >= 0)
             {
@@ -211,13 +225,22 @@ namespace DodgeBattleStarter
                     {
                         int xPos = arr.IndexOf("\"x\":", idx);
                         if (xPos < 0) break;
+
                         float x = ExtractFloatAfter(arr, "\"x\":", xPos);
                         float y = ExtractFloatAfter(arr, "\"y\":", xPos);
-                        snap.Obstacles.Add(new PointF(x, y));
-                        idx = xPos + 4;
+                        float w = ExtractFloatAfter(arr, "\"w\":", xPos);
+                        float h = ExtractFloatAfter(arr, "\"h\":", xPos);
+                        int k = ExtractIntAfter(arr, "\"k\":", xPos);
+
+                        snap.Obstacles.Add(new NetObstacle { X = x, Y = y, W = w, H = h, K = k });
+
+                        // 다음 검색 시작 지점 갱신
+                        int closeObj = arr.IndexOf("}", xPos);
+                        idx = (closeObj >= 0 ? closeObj : xPos + 4) + 1;
                     }
                 }
             }
+
             return snap;
         }
 
@@ -239,6 +262,7 @@ namespace DodgeBattleStarter
             if (j < 0) return null;
             return json.Substring(i + 1, j - i - 1);
         }
+
         static int ExtractInt(string json, string key)
         {
             int i = json.IndexOf("\"" + key + "\"");
@@ -252,6 +276,20 @@ namespace DodgeBattleStarter
             int.TryParse(json.Substring(j, k - j), out int v);
             return v;
         }
+
+        static int ExtractIntAfter(string s, string key, int start)
+        {
+            int i = s.IndexOf(key, start);
+            if (i < 0) return 0;
+            i += key.Length;
+            while (i < s.Length && (s[i] == ' ' || s[i] == '\t')) i++;
+            int k = i;
+            while (k < s.Length && "-0123456789".IndexOf(s[k]) >= 0) k++;
+            int.TryParse(s.Substring(i, k - i), System.Globalization.NumberStyles.Integer,
+                         System.Globalization.CultureInfo.InvariantCulture, out int v);
+            return v;
+        }
+
         static float ExtractFloatAfter(string s, string key, int start)
         {
             int i = s.IndexOf(key, start);
@@ -260,9 +298,11 @@ namespace DodgeBattleStarter
             while (i < s.Length && (s[i] == ' ' || s[i] == '\t')) i++;
             int k = i;
             while (k < s.Length && "-0123456789.eE".IndexOf(s[k]) >= 0) k++;
-            float.TryParse(s.Substring(i, k - i), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float v);
+            float.TryParse(s.Substring(i, k - i), System.Globalization.NumberStyles.Float,
+                           System.Globalization.CultureInfo.InvariantCulture, out float v);
             return v;
         }
+
         static bool ExtractBoolAfter(string s, string key, int start)
         {
             int i = s.IndexOf(key, start);
