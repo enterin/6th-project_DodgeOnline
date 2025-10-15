@@ -69,6 +69,8 @@ namespace DodgeServer
         // ★ 추가
         public bool Ready = false;
         public int ColorRgb = 0x39A9F9;   // 기본 하늘색
+
+        public bool LeftToLobby;  // ★ NEW: L키로 개인 로비 이동 여부
     }
 
 
@@ -106,6 +108,7 @@ namespace DodgeServer
         const int CountdownMs = 3000; // 3초
         int _countdownMsLeft = 0;
         int _roundElapsedMs = 0;      // 라운드 경과시간(ms)
+        const int MaxRoundsBeforeLobby = 3;   // 3라운드 후 로비
 
         // 1) enum 확장
         public enum ObKind { Knife = 0, Boom = 1, Fire = 2, Explosion = 3 }
@@ -239,7 +242,19 @@ namespace DodgeServer
                         + "}";
                     Wire.SendJson(ns, welcome);
 
-                    BroadcastLobby();  // ★ 새 유저 입장 반영
+                    lock (_lock)
+                        {
+                            if (_phase == Phase.Lobby)
+                            {
+                                BroadcastLobby();          // 로비 중엔 모두에게 반영
+                            }
+                            else
+                            {
+                                p.LeftToLobby = true;      // 게임 중 합류자는 개인 로비로 대기
+                                p.Ready = false;
+                                SendLobbyTo(p);            // 본인에게만 로비 페이로드
+                            }
+                        }
 
                     Console.WriteLine("[JOIN] " + p.Id + " connected");
 
@@ -284,9 +299,10 @@ namespace DodgeServer
                             if (_phase == Phase.AwaitingRestart)
                             {
                                 _respawnVotes.Add(p.Id);
-                                Console.WriteLine("[VOTE] " + p.Id + " -> " + _respawnVotes.Count + "/" + _players.Count);
-                                if (_players.Count > 0 && _respawnVotes.Count >= _players.Count)
-                                    RestartRound_Locked();
+                                int active = ActivePlayerCount_Locked();
+                                Console.WriteLine("[VOTE] " + p.Id + " -> " + _respawnVotes.Count + "/" + active);
+                                if (active > 0 && _respawnVotes.Count >= active)
+                                    NextRoundOrLobby_Locked();
                             }
                         }
                     }
@@ -296,7 +312,8 @@ namespace DodgeServer
                         lock (_lock)
                         {
                             if (!string.IsNullOrEmpty(nm)) p.Name = nm;
-                            BroadcastLobby();
+                            if (_phase == Phase.Lobby) BroadcastLobby();
+                            else SendLobbyTo(p);                 // 개인 로비 정보만 갱신
                         }
                     }
                     else if (json.IndexOf("\"cmd\":\"SET_COLOR\"") >= 0)
@@ -305,7 +322,8 @@ namespace DodgeServer
                         lock (_lock)
                         {
                             p.ColorRgb = TryParseHtmlRgb(col, p.ColorRgb);
-                            BroadcastLobby();
+                            if (_phase == Phase.Lobby) BroadcastLobby();
+                            else SendLobbyTo(p);
                         }
                     }
                     else if (json.IndexOf("\"cmd\":\"READY\"") >= 0)
@@ -314,10 +332,34 @@ namespace DodgeServer
                         lock (_lock)
                         {
                             p.Ready = r;
-                            BroadcastLobby();
-                            TryStartCountdownFromLobby_Locked();  // ★ 전원 Ready면 시작
+                            if (_phase == Phase.Lobby)
+                            {
+                                BroadcastLobby();
+                                TryStartCountdownFromLobby_Locked();  // 로비일 때만 카운트다운 체크
+                            }
+                            else
+                            {
+                                SendLobbyTo(p);  // 게임 중 합류자가 눌러도 본인 UI만 갱신
+                            }
                         }
                     }
+                    // ★ RECV 처리
+                    else if (json.IndexOf("\"cmd\":\"LEAVE_TO_LOBBY\"") >= 0)
+                    {
+                        lock (_lock)
+                        {
+                            if (_phase != Phase.Lobby && _players.TryGetValue(p.Id, out var me))
+                            {
+                                me.LeftToLobby = true;
+                                me.Ready = false;           // 안전상 해제
+                                Console.WriteLine($"[LEAVE] {me.Name} -> Lobby (solo)");
+
+                                // 본인에게만 로비 패킷 단독 전송(다른 사람은 그대로 게임)
+                                SendLobbyTo(p);             // ★ 아래 함수 추가
+                            }
+                        }
+                    }
+
                 }
             }
             catch { }
@@ -340,6 +382,7 @@ namespace DodgeServer
         {
             if (_phase != Phase.Lobby) return;
             if (_players.Count == 0) return;
+            if (_round <= 0) _round = 1;   // ● 로비에서 첫 게임 시작이면 1라운드로
             foreach (var kv in _players) if (!kv.Value.Ready) return;
 
             _phase = Phase.Countdown;
@@ -367,6 +410,7 @@ namespace DodgeServer
             {
                 if (_players.Remove(p.Id))
                 {
+                    p.LeftToLobby = false;   // ★ 안전 정리: 개인 로비 상태 해제
                     _respawnVotes.Remove(p.Id);
                     Console.WriteLine("[LEAVE] " + p.Id);
                     try { p.Ns.Close(); } catch { }
@@ -383,10 +427,17 @@ namespace DodgeServer
                         TryStartCountdownFromLobby_Locked();
                     }
                 }
+
+                // ★ 남은 활성 인원이 0이면 즉시 로비로
+                int activeLeft = 0;
+                foreach (var kv in _players) if (!kv.Value.LeftToLobby) activeLeft++;
+                if (activeLeft == 0 && _phase != Phase.Lobby)
+                {
+                    Console.WriteLine("[AUTO] Last active left -> LOBBY");
+                    GoToLobby_Locked();
+                }
             }
         }
-
-        // ====== 장애물 스폰/업데이트 파라미터 ======
 
         // 시간 경과에 따라 해금된 종류 목록을 돌려줌
         List<ObKind> GetUnlockedKinds()
@@ -550,6 +601,21 @@ namespace DodgeServer
 
             lock (_lock)
             {
+                // ★ 활성 인원(LeftToLobby=false) 계산
+                int activeCount = 0;
+                foreach (var kv in _players) if (!kv.Value.LeftToLobby) activeCount++;
+
+                // 아무도 게임에 남아있지 않으면 즉시 전체 로비로
+                if (activeCount == 0)
+                {
+                    if (_phase != Phase.Lobby)
+                    {
+                        Console.WriteLine("[AUTO] No active players -> LOBBY");
+                        GoToLobby_Locked();
+                    }
+                    return; // 물리/스폰 중단
+                }
+
                 if (_phase == Phase.Lobby)
                 {
                     // 로비는 물리/스폰 정지 (로비 패킷은 이벤트 시에만 전송)
@@ -630,6 +696,7 @@ namespace DodgeServer
                     foreach (var kv in _players)
                     {
                         var p = kv.Value;
+                        if (p.LeftToLobby) continue;   // ★ 개인 로비 유저 제외
                         if (!p.Alive) continue;
 
                         // ★ 넉백 보호시간 동안은 '입력/감속'을 적용하지 않음
@@ -692,7 +759,12 @@ namespace DodgeServer
 
                     // 모두 사망 감지 → 투표 대기
                     int aliveCount = 0;
-                    foreach (var kv in _players) if (kv.Value.Alive) aliveCount++;
+                    foreach (var kv in _players)
+                    {
+                        var p = kv.Value;
+                        if (p.LeftToLobby) continue;   // ★ 개인 로비 유저 제외
+                        if (p.Alive) aliveCount++;
+                    }
                     if (_players.Count > 0 && aliveCount == 0)
                     {
                         _phase = Phase.AwaitingRestart;
@@ -706,7 +778,6 @@ namespace DodgeServer
                 }
             }
         }
-
 
         void ApplyBounds(Player p)
         {
@@ -814,7 +885,6 @@ namespace DodgeServer
 
             _tick = 0;
 
-            _round += 1;
             _rng = new Random(_seed);   // 같은 패턴 유지. 새 패턴 원하면 _seed 대신 Environment.TickCount
 
             foreach (var kv in _players)
@@ -851,41 +921,119 @@ namespace DodgeServer
             return value;
         }
 
+        // 3-1) 공통 JSON 생성기
+        string BuildLobbyJson_Locked()
+        {
+            var sb = new StringBuilder(2048);
+            sb.Append("{\"cmd\":\"LOBBY\",\"phase\":\"lobby\",\"players\":[");
+            bool first = true;
+            int ready = 0, need = 0;
+
+            foreach (var kv in _players)
+            {
+                var p = kv.Value; need++;
+                if (p.Ready) ready++;
+
+                if (!first) sb.Append(",");
+                first = false;
+                sb.Append("{\"id\":\"").Append(p.Id)
+                  .Append("\",\"name\":\"").Append(Escape(p.Name))
+                  .Append("\",\"color\":\"#").Append(p.ColorRgb.ToString("X6"))
+                  .Append("\",\"ready\":").Append(p.Ready ? "true" : "false")
+                  .Append("}");
+            }
+            sb.Append("],\"need_count\":").Append(need)
+              .Append(",\"ready_count\":").Append(ready).Append("}");
+            return sb.ToString();
+        }
+
+        //활성 인원(LeftToLobby 제외) 카운터 추가
+        int ActivePlayerCount_Locked()
+        {
+            int n = 0;
+            foreach (var kv in _players) if (!kv.Value.LeftToLobby) n++;
+            return n;
+        }
+
         void BroadcastLobby()
         {
             string json;
             lock (_lock)
             {
-                var sb = new StringBuilder(2048);
-                sb.Append("{\"cmd\":\"LOBBY\",\"phase\":\"lobby\",\"players\":[");
-                bool first = true;
-                int ready = 0, need = 0;
+                json = BuildLobbyJson_Locked();
+            }
+            foreach (var kv in _players)
+            {
+                var pl = kv.Value;
+                if (pl.LeftToLobby) continue;   // 게임 미참여자에게는 SNAPSHOT 전송 안 함
+                try { Wire.SendJson(pl.Ns, json); } catch { }
+            }
+        }
 
-                foreach (var kv in _players)
-                {
-                    var p = kv.Value; need++;
-                    if (p.Ready) ready++;
+        void SendLobbyTo(Player target)
+        {
+            string json;
+            lock (_lock)
+            {
+                json = BuildLobbyJson_Locked(); // ★ 같은 페이로드
+            }
+            try { Wire.SendJson(target.Ns, json); } catch { }
+        }
 
-                    if (!first) sb.Append(",");
-                    first = false;
-                    sb.Append("{\"id\":\"").Append(p.Id)
-                      .Append("\",\"name\":\"").Append(Escape(p.Name))
-                      .Append("\",\"color\":\"#").Append(p.ColorRgb.ToString("X6"))
-                      .Append("\",\"ready\":").Append(p.Ready ? "true" : "false")
-                      .Append("}");
-                }
-                sb.Append("],\"need_count\":").Append(need)
-                  .Append(",\"ready_count\":").Append(ready).Append("}");
 
-                json = sb.ToString();
+
+        void NextRoundOrLobby_Locked()
+        {
+            // 현재 라운드가 막 끝난 시점이라고 가정
+            if (_round >= MaxRoundsBeforeLobby)
+            {
+                Console.WriteLine("[STATE] Max rounds reached -> LOBBY");
+                GoToLobby_Locked();
+                _round = 1;                    // 다음 게임을 1라운드부터
+            }
+            else
+            {
+                _round++;
+                RestartRound_Locked();
+            }
+        }
+
+        void GoToLobby_Locked()
+        {
+            // ● 리셋 전에 "게임에 남아 있던 활성 인원"을 먼저 기억
+            int activeBeforeReset = ActivePlayerCount_Locked();
+
+            _phase = Phase.Lobby;
+            _countdownMsLeft = 0;
+            _roundElapsedMs = 0;
+            _obstacles.Clear();
+            _respawnVotes.Clear();
+
+            // ★ 개인 로비 플래그 리셋: 모두 로비에 모임
+            foreach (var kv in _players)
+            {
+                var pl = kv.Value;
+                pl.LeftToLobby = false;    // ★ NEW
+                pl.Ready = false;
+                pl.Alive = true;
+                pl.VX = pl.VY = 0;
+                pl.Score = 0;
+                // 위치 초기화 등 기존 로직...
             }
 
-            foreach (var kv in _players)
-                try { Wire.SendJson(kv.Value.Ns, json); } catch { }
+            // ● 리셋 전 기준으로 결정: 게임에 0명이면 0라운드, 아니면 1라운드 대기
+            _round = (activeBeforeReset == 0) ? 0 : 1;
+
+            BroadcastLobby();
         }
+
 
         void BroadcastSnapshot()
         {
+            // ★ LeftToLobby 제외한 활성 인원 계산
+            int activeCount = 0;
+            foreach (var kv in _players) if (!kv.Value.LeftToLobby) activeCount++;
+
             StringBuilder sb = new StringBuilder(4096);
             sb.Append("{\"cmd\":\"SNAPSHOT\",\"tick\":").Append(_tick).Append(",")
               .Append("\"round\":").Append(_round).Append(",")
@@ -896,8 +1044,7 @@ namespace DodgeServer
                          _phase == Phase.Countdown ? "countdown" : "lobby")
               .Append("\",")
               .Append("\"countdown_ms\":").Append(_countdownMsLeft).Append(",")
-              .Append("\"vote_count\":").Append(_respawnVotes.Count).Append(",")
-              .Append("\"need_count\":").Append(_players.Count).Append(",");
+              .Append("\"need_count\":").Append(activeCount).Append(",");   // ★ 변경
 
             lock (_lock)
             {
@@ -907,6 +1054,7 @@ namespace DodgeServer
                 foreach (var kv in _players)
                 {
                     var p = kv.Value;
+                    if (p.LeftToLobby) continue;   // ★ 개인 로비로 빠진 유저는 스냅샷에서 제외
                     if (!first) sb.Append(",");
                     first = false;
                     sb.Append("{\"id\":\"").Append(p.Id).Append("\",")
@@ -937,8 +1085,10 @@ namespace DodgeServer
 
                 foreach (var kv in _players)
                 {
-                    try { Wire.SendJson(kv.Value.Ns, json); }
-                    catch { /* 끊어진 연결은 Recv/Disconnect에서 정리 */ }
+                    var pl = kv.Value;
+                    if (pl.LeftToLobby) continue;      // ★ 개인 로비 유저에게는 스냅샷 보내지 않음
+                    try { Wire.SendJson(pl.Ns, json); }
+                    catch { /* ... */ }
                 }
             }
         }

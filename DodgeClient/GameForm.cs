@@ -70,7 +70,7 @@ namespace DodgeBattleStarter
         private string _colorHtml = "#39A9F9";
 
         // ====== 오프라인용 ======
-        class Player    
+        class Player
         {
             public string Id = "local";
             public Color Color = Color.DeepSkyBlue;
@@ -90,7 +90,7 @@ namespace DodgeBattleStarter
         // ====== 온라인 모드 ======
         NetClient _net;
         bool _online = false;
-        string _serverHost = "127.0.0.1";
+        string _serverHost = "10.10.21.123";
         int _serverPort = 5055;
         string _nickname = "player1";
 
@@ -171,7 +171,7 @@ namespace DodgeBattleStarter
 
                 // 🔸 2:3 직사각형 비율 (조금 넓게)
                 _imgFire1 = ScaleToKeepRatio(_imgFireRaw1, new Size(30, 20));
-                _imgFire2 = ScaleToKeepRatio(_imgFireRaw2, new Size(30, 20));   
+                _imgFire2 = ScaleToKeepRatio(_imgFireRaw2, new Size(30, 20));
             }
             catch (Exception ex)
             {
@@ -198,6 +198,8 @@ namespace DodgeBattleStarter
 
             // 내 닉네임 초기값(원하면 바꿔도 무방)
             _tbName.Text = _nickname;
+
+            this.KeyDown += OnKeyDown;   // ★ 키 이벤트 연결
         }
 
         private void BuildLobbyUi()
@@ -348,6 +350,7 @@ namespace DodgeBattleStarter
             if (_lvLobby.Parent != null) _lvLobby.Parent.BringToFront();
         }
 
+        bool _strongHighlight = true;   // H키로 토글
 
         private void UpdateLobbyUI(NetLobby lobby)
         {
@@ -372,6 +375,15 @@ namespace DodgeBattleStarter
                 _lvLobby.Items.Add(it);
             }
             _lvLobby.EndUpdate();
+        }
+
+        // 내 Ready 상태와 버튼 텍스트를 동시에 맞추는 헬퍼
+        void SetMyReady(bool v)
+        {
+            _readyLocal = v;
+            if (_btnReady != null)
+                _btnReady.Text = v ? "UNREADY" : "READY";
+            // 서버로 굳이 보낼 필요는 없음(서버는 로비 진입 시 Ready=false로 초기화함)
         }
 
         // ================= 유틸: 이미지 스케일(비율 유지) =================
@@ -428,13 +440,30 @@ namespace DodgeBattleStarter
 
             if (_online && _net != null)
             {
-                // LOBBY 스냅샷 확인
+                // 1) 서버가 보낸 LOBBY 있으면: 즉시 로비 화면으로 전환
                 NetLobby lb = _net.TryGetLobby();
-                UpdateLobbyUI(lb);
+                if (lb != null)
+                {
+                    UpdateLobbyUI(lb);        // 우측 패널/리스트 표시
+                                              // 내 Ready UI/상태도 해제
+                    SetMyReady(false);
+
+                    Invalidate();             // 바로 다시 그리기
+                    return;                   // ★ 이번 프레임은 여기서 끝 (게임 렌더/로직 스킵)
+                }
+
+                // 2) 로비가 아니라면(= 게임 중 스냅샷 존재) 로비 패널은 숨김
+                var snap = _net.TryGetSnapshot();
+                if (snap != null)
+                {
+                    UpdateLobbyUI(null);      // 패널/리스트 숨김
+                                              // (필요 시 여기서 온라인 렌더용 캐싱 등 계속)
+                }
             }
 
             Invalidate();
         }
+
 
         // =============== 메인 업데이트 ===============
         void Step(float dt)
@@ -680,6 +709,7 @@ namespace DodgeBattleStarter
             if (e.KeyCode == Keys.Left || e.KeyCode == Keys.A) { _local.Left = true; _facingRight = false; }
             if (e.KeyCode == Keys.Right || e.KeyCode == Keys.D) { _local.Right = true; _facingRight = true; }
             if (e.KeyCode == Keys.Up || e.KeyCode == Keys.W || e.KeyCode == Keys.Space) _local.Up = true;
+            if (e.KeyCode == Keys.H) _strongHighlight = !_strongHighlight;
 
             if (_online && _net != null)
                 _net.SendInput(_local.Left, _local.Right, _local.Up);
@@ -700,6 +730,17 @@ namespace DodgeBattleStarter
                 // 로비가 아니면 기존 동작 유지 (온라인: RESPAWN, 오프라인: Reset)
                 if (_online && _net != null) _net.SendRespawn();
                 else ResetGame();
+            }
+
+            if (_online && _net != null && e.KeyCode == Keys.L)
+            {
+                // 로비가 아닐 때만 개인 로비 이동 요청
+                var snap = _net.TryGetSnapshot();
+                if (snap == null || snap.Phase != "lobby")
+                {
+                    _net.SendLeaveToLobby();
+                    e.Handled = true;
+                }
             }
 
             if (e.KeyCode == Keys.Escape) Close();
@@ -744,24 +785,50 @@ namespace DodgeBattleStarter
             var r = Rectangle.Round(rect);
             Image img = facingRight ? _imgPlayerRight : _imgPlayerLeft;
 
-            if (img != null)
-            {
-                g.DrawImage(img, r);
-
-                if (!alive)
-                {
-                    using (var dim = new SolidBrush(Color.FromArgb(120, 0, 0, 0)))
-                    {
-                        g.FillRectangle(dim, r);
-                    }
-                }
-            }
+            // 본체
+            if (img != null) g.DrawImage(img, r);
             else
             {
                 using (var br = new SolidBrush(alive ? Color.DeepSkyBlue : Color.Gray))
-                {
                     g.FillRectangle(br, r);
+            }
+
+            // 죽었으면 어둡게
+            if (!alive)
+            {
+                using (var dim = new SolidBrush(Color.FromArgb(120, 0, 0, 0)))
+                    g.FillRectangle(dim, r);
+            }
+
+            if (!highlight) return;
+
+            // ===== 강조(펄스 링 없음) =====
+            // 1) 얇은 외곽선
+            using (var pen = new Pen(Color.FromArgb(220, 80, 200, 255), 2))
+                g.DrawRectangle(pen, r);
+
+            // 2) 바닥 하이라이트(그림자형 원)
+            Rectangle shadow = new Rectangle(r.X - 8, r.Bottom - 6, r.Width + 16, 10);
+            using (var sh = new SolidBrush(Color.FromArgb(70, 80, 200, 255)))
+                g.FillEllipse(sh, shadow);
+
+            // 3) 머리 위 "YOU" 배지
+            using (var font = new Font("Segoe UI", 9, FontStyle.Bold))
+            {
+                string tag = "YOU";
+                SizeF sz = g.MeasureString(tag, font);
+                RectangleF label = new RectangleF(
+                    r.X + (r.Width - sz.Width) / 2f - 6,
+                    r.Y - sz.Height - 8,
+                    sz.Width + 12, sz.Height + 6);
+
+                using (var bg = new SolidBrush(Color.FromArgb(200, 0, 0, 0)))
+                using (var pen2 = new Pen(Color.FromArgb(220, 80, 200, 255)))
+                {
+                    g.FillRectangle(bg, label);
+                    g.DrawRectangle(pen2, Rectangle.Round(label));
                 }
+                g.DrawString(tag, font, Brushes.White, label.X + 6, label.Y + 3);
             }
         }
 
@@ -876,7 +943,7 @@ namespace DodgeBattleStarter
                                 g.FillEllipse(b, rectB);
                         }
                     }
-                    else 
+                    else
                     {
                         using (var b = new SolidBrush(Color.OrangeRed)) g.FillRectangle(b, r);
                     }
@@ -885,6 +952,8 @@ namespace DodgeBattleStarter
 
 
                 // ---- 온라인 플레이어 렌더 ----
+                RectangleF? myRectForLater = null;
+
                 foreach (var kv in _playersOnline)
                 {
                     var id = kv.Key;
@@ -907,9 +976,22 @@ namespace DodgeBattleStarter
 
                     bool alive = _aliveOnline.Contains(id);
                     bool me = (_net != null && id == _net.MyId);
-                    if (me) faceRight = _facingRight;
+                    if (me)
+                    {
+                        myRectForLater = rect;           // ★ 내 캐릭터는 나중에(최상단) 그리기
+                        continue;
+                    }
 
-                    DrawPlayerSprite(e.Graphics, rect, alive, highlight: me, facingRight: faceRight);
+                    DrawPlayerSprite(e.Graphics, rect, alive, highlight: false, facingRight: faceRight);
+                }
+
+                // ★ 마지막에 내 캐릭터를 최상단으로 강조 그리기
+                if (myRectForLater.HasValue)
+                {
+                    DrawPlayerSprite(e.Graphics, myRectForLater.Value,
+                                     _aliveOnline.Contains(_net.MyId),
+                                     highlight: _strongHighlight,         // 토글 반영
+                                     facingRight: _facingRight);
                 }
 
                 // ---- 상단 작은 텍스트 + 라운드/스코어보드/HUD ----
@@ -1058,6 +1140,18 @@ namespace DodgeBattleStarter
                                     e.Graphics.DrawString(msg, big, Brushes.White,
                                         (ClientSize.Width - sz.Width) / 2f,
                                         (ClientSize.Height - sz.Height) / 2f);
+                                }
+                            }
+                            else if (snapForHud.Phase == "playing")
+                            {
+                                using (var big = new Font("Segoe UI", 12, FontStyle.Bold))
+                                {
+                                    string msg = "Press L to leave to Lobby (solo)";
+                                    SizeF sz = e.Graphics.MeasureString(msg, big);
+                                    // 좌측 상단 HUD 아래에 반투명 패널로 안내
+                                    RectangleF rect = new RectangleF(12, 36, sz.Width + 12, sz.Height + 8);
+                                    e.Graphics.FillRectangle(panelBg, rect);
+                                    e.Graphics.DrawString(msg, big, Brushes.White, 18, 40);
                                 }
                             }
                         }

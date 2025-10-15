@@ -74,6 +74,24 @@ namespace DodgeBattleStarter
             }
         }
 
+        // ★ LOBBY 수신 플래그/버퍼
+        volatile bool _hasLobby;
+        string _lobbyJson;
+
+        // ★ GameForm에서 한 번만 소비
+        public bool TryConsumeLobby(out string json)
+        {
+            if (_hasLobby)
+            {
+                json = _lobbyJson;
+                _lobbyJson = null;
+                _hasLobby = false;
+                return true;
+            }
+            json = null;
+            return false;
+        }
+
         public void Close()
         {
             _running = false;
@@ -107,6 +125,9 @@ namespace DodgeBattleStarter
 
         public void SendReady(bool ready)
             => SendJson("{\"cmd\":\"READY\",\"ready\":" + (ready ? "true" : "false") + "}");
+
+        public void SendLeaveToLobby()  // ★ NEW
+            => SendJson("{\"cmd\":\"LEAVE_TO_LOBBY\"}");
 
         // ====== Wire ======
         void SendJson(string json)
@@ -181,6 +202,11 @@ namespace DodgeBattleStarter
                     {
                         NetLobby lb = ParseLobby(json);
                         lock (_lobbyLock) _lobbyLatest = lb;
+                    }
+                    else if (json.IndexOf("\"cmd\":\"LOBBY\"") >= 0)  // ★ 로비 패킷 수신
+                    {
+                        _lobbyJson = json;
+                        _hasLobby = true;
                     }
                     // (그 외 cmd는 현재 없음)
                 }
