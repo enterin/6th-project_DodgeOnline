@@ -29,6 +29,7 @@ namespace DodgeBattleStarter
             public List<NetLobbyPlayer> Players = new List<NetLobbyPlayer>();
             public int Need;
             public int Ready;
+            public int Ts;   // ★ 추가
         }
 
         // ====== State ======
@@ -333,6 +334,8 @@ namespace DodgeBattleStarter
                     }
                 }
             }
+            lb.Ts = Environment.TickCount;  // ★ 지금 받은 로비의 도착 시각 기록
+
             return lb;
         }
 

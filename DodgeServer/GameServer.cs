@@ -331,6 +331,11 @@ namespace DodgeServer
                         bool r = ExtractBool(json, "ready");
                         lock (_lock)
                         {
+                            if (p.Ready == r)
+                            {   /*변동 없으면 무시*/  
+                                if (_phase == Phase.Lobby) { /*로비 UI 갱신 불필요*/ } continue; 
+                            }
+
                             p.Ready = r;
                             if (_phase == Phase.Lobby)
                             {
@@ -944,6 +949,10 @@ namespace DodgeServer
             }
             sb.Append("],\"need_count\":").Append(need)
               .Append(",\"ready_count\":").Append(ready).Append("}");
+            sb.Append("],\"need_count\":").Append(need)
+            .Append(",\"ready_count\":").Append(ready)
+            .Append(",\"ts\":").Append((int)_sw.ElapsedMilliseconds)   // ★ 추가: 최신성 판별용
+            .Append("}");
             return sb.ToString();
         }
 

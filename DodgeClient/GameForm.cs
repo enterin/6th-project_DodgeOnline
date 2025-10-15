@@ -107,6 +107,10 @@ namespace DodgeBattleStarter
         HashSet<string> _aliveOnline = new HashSet<string>();
         Dictionary<string, int> _scoreOnline = new Dictionary<string, int>();
 
+        // Ready 전송 디바운스 & 최신 LOBBY 판별용
+        DateTime _lastReadySend = DateTime.MinValue;
+        long _lastLobbyTs = -1;      // 서버가 LOBBY에 넣어주는 ts(없으면 그대로 -1 유지)
+
         public GameForm()
         {
             Text = "Dodge Battle (← →, ↑/Space: 점프 | R: 재시작/투표 | T: 봇 on/off | Esc: 종료)";
@@ -269,15 +273,18 @@ namespace DodgeBattleStarter
             _btnPickColor = new Button { Text = "Pick Color", Width = 240 };
             _btnPickColor.Click += (s, e) =>
             {
-                using (ColorDialog cd = new ColorDialog())
-                {
-                    if (cd.ShowDialog() == DialogResult.OK)
-                    {
-                        _colorHtml = "#" + cd.Color.R.ToString("X2") + cd.Color.G.ToString("X2") + cd.Color.B.ToString("X2");
-                        _pColorPreview.BackColor = cd.Color;
-                        if (_online && _net != null) _net.SendSetColor(_colorHtml);
-                    }
-                }
+                // ① 디바운스(중복 빠른 클릭 무시)
+                var now = DateTime.UtcNow;
+                if ((now - _lastReadySend).TotalMilliseconds < 120) return;
+                _lastReadySend = now;
+
+                // ② 낙관적 UI 토글(서버 확정 오면 다시 맞춰줌)
+                bool want = !_readyLocal;
+                _readyLocal = want;
+                _btnReady.Text = _readyLocal ? "UNREADY" : "READY";
+
+                if (_online && _net != null)
+                    _net.SendReady(want);
             };
 
             _btnReady = new Button { Text = "READY", Width = 240, Height = 32 };
@@ -354,20 +361,18 @@ namespace DodgeBattleStarter
 
         private void UpdateLobbyUI(NetLobby lobby)
         {
-            // 우측 패널/리스트 표시 상태 토글 (로비에서만 보이게)
             bool show = (lobby != null);
             _pLobby.Visible = show;
-            // 리스트 담고 있는 중앙 패널은 _lvLobby.Parent (center)
             if (_lvLobby.Parent != null) _lvLobby.Parent.Visible = show;
 
-            if (lobby == null) return;
+            if (!show) return;
 
             _lvLobby.BeginUpdate();
             _lvLobby.Items.Clear();
             for (int i = 0; i < lobby.Players.Count; i++)
             {
-                NetLobbyPlayer pl = lobby.Players[i];
-                ListViewItem it = new ListViewItem((i + 1).ToString());
+                var pl = lobby.Players[i];
+                var it = new ListViewItem((i + 1).ToString());
                 string nm = string.IsNullOrEmpty(pl.Name) ? pl.Id : pl.Name;
                 if (nm.Length > 18) nm = nm.Substring(0, 18) + "…";
                 it.SubItems.Add(nm);
@@ -375,6 +380,10 @@ namespace DodgeBattleStarter
                 _lvLobby.Items.Add(it);
             }
             _lvLobby.EndUpdate();
+
+            // ★ 혹시나 Z-Order 꼬임 방지
+            _pLobby.BringToFront();
+            if (_lvLobby.Parent != null) _lvLobby.Parent.BringToFront();
         }
 
         // 내 Ready 상태와 버튼 텍스트를 동시에 맞추는 헬퍼
@@ -429,6 +438,7 @@ namespace DodgeBattleStarter
             if (dt <= 0) return;
             _prevMs = now;
 
+            // 고정 스텝
             float fixedDt = 1f / TargetFps;
             float acc = dt;
             while (acc > 0f)
@@ -440,30 +450,45 @@ namespace DodgeBattleStarter
 
             if (_online && _net != null)
             {
-                // 1) 서버가 보낸 LOBBY 있으면: 즉시 로비 화면으로 전환
+                // ── 1) 서버 LOBBY 수신 시: 즉시 로비 화면으로 전환하고 종료 ──
                 NetLobby lb = _net.TryGetLobby();
                 if (lb != null)
                 {
-                    UpdateLobbyUI(lb);        // 우측 패널/리스트 표시
-                                              // 내 Ready UI/상태도 해제
-                    SetMyReady(false);
+                    UpdateLobbyUI(lb);
 
-                    Invalidate();             // 바로 다시 그리기
-                    return;                   // ★ 이번 프레임은 여기서 끝 (게임 렌더/로직 스킵)
+                    // 내 READY 상태는 서버 기준으로만 동기화
+                    bool myReady = false;
+                    if (lb.Players != null && _net != null)
+                    {
+                        foreach (var pl in lb.Players)
+                            if (pl.Id == _net.MyId) { myReady = pl.Ready; break; }
+                    }
+                    if (myReady != _readyLocal)
+                    {
+                        _readyLocal = myReady;
+                        if (_btnReady != null) _btnReady.Text = _readyLocal ? "UNREADY" : "READY";
+                    }
+
+                    // 게임 캐시 클리어(로비 잔상 방지)
+                    _obsOnline.Clear();
+                    _playersOnline.Clear();
+                    _aliveOnline.Clear();
+                    _scoreOnline.Clear();
+
+                    Invalidate();
+                    return; // ★ 이번 프레임은 로비 전용
                 }
 
-                // 2) 로비가 아니라면(= 게임 중 스냅샷 존재) 로비 패널은 숨김
-                var snap = _net.TryGetSnapshot();
-                if (snap != null)
-                {
-                    UpdateLobbyUI(null);      // 패널/리스트 숨김
-                                              // (필요 시 여기서 온라인 렌더용 캐싱 등 계속)
-                }
+                // ── 2) 로비가 아니면 패널 숨김 ──
+                UpdateLobbyUI(null);
+
+                // (선택) 여기서 스냅샷을 확인해도 되고,
+                // 이미 Step()에서 온라인이면 스냅샷 파싱만 하고 리턴하므로 생략 가능
+                // var snap = _net.TryGetSnapshot(); // 필요시 사용
             }
 
             Invalidate();
         }
-
 
         // =============== 메인 업데이트 ===============
         void Step(float dt)
