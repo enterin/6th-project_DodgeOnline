@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;           // Rectangle / RectangleF
@@ -105,6 +106,10 @@ namespace DodgeServer
         // 라운드/카운트다운/페이즈
         enum Phase { Lobby, Countdown, Playing, AwaitingRestart }
         int _round = 1;
+        int _matchRound = 1;
+        const int MatchTotal = 3;
+        Dictionary<string, int> _totalScores = new Dictionary<string, int>();
+        bool _roundTallied = false;
         const int CountdownMs = 3000; // 3초
         int _countdownMsLeft = 0;
         int _roundElapsedMs = 0;      // 라운드 경과시간(ms)
@@ -396,6 +401,10 @@ namespace DodgeServer
             _obstacles.Clear();
             _respawnVotes.Clear();
             _tick = 0;
+            _round = 1;           // ★ 새 게임 시작은 항상 1라운드
+            _matchRound = 1;      // ★ 매치 라운드도 1부터
+            _totalScores.Clear(); // ★ 합계 초기화
+            _roundTallied = false;
 
             foreach (var kv in _players)
             {
@@ -636,6 +645,7 @@ namespace DodgeServer
                         _phase = Phase.Playing;
                         _roundElapsedMs = 0;
                         Console.WriteLine("[ROUND] Round " + _round + " START");
+                        _roundTallied = false; // ★ 라운드 시작: 아직 합계 반영 전
                     }
                     return;
                 }
@@ -775,6 +785,20 @@ namespace DodgeServer
                         _phase = Phase.AwaitingRestart;
                         _respawnVotes.Clear();
                         Console.WriteLine("[ROUND] All dead -> AwaitingRestart (press R to vote)");
+                        // ★ 라운드 종료 시 합계에 1회 반영
+                        if (!_roundTallied)
+                        {
+                            foreach (var kv2 in _players)
+                            {
+                                var pp = kv2.Value;
+                                if (!pp.LeftToLobby) // 활성만 합계에
+                                {
+                                    if (!_totalScores.ContainsKey(pp.Id)) _totalScores[pp.Id] = 0;
+                                    _totalScores[pp.Id] += pp.Score;
+                                }
+                            }
+                            _roundTallied = true;
+                        }
                     }
                 }
                 else
@@ -909,6 +933,7 @@ namespace DodgeServer
             }
 
             Console.WriteLine("[ROUND] Restarted -> Round " + _round);
+            _roundTallied = false;   // ★ 다음 라운드 집계 준비
             BroadcastSnapshot(); // 즉시 1회 전송해 UI 빠르게 갱신
         }
 
@@ -980,22 +1005,26 @@ namespace DodgeServer
             try { Wire.SendJson(target.Ns, json); } catch { }
         }
 
-
-
         void NextRoundOrLobby_Locked()
         {
-            // 현재 라운드가 막 끝난 시점이라고 가정
-            if (_round >= MaxRoundsBeforeLobby)
+            // 현재 라운드가 막 끝난 시점 (투표 만장일치)
+            if (_matchRound >= MatchTotal)
             {
-                Console.WriteLine("[STATE] Max rounds reached -> LOBBY");
-                GoToLobby_Locked();
-                _round = 1;                    // 다음 게임을 1라운드부터
+                Console.WriteLine("[MATCH] Finished -> match_over");
+                BroadcastMatchOver();               // ★ 합계 스냅샷 한번 쏘고
+                // 4초 보여준 뒤 로비 이동
+                new Thread(() =>
+                {
+                    Thread.Sleep(4000);
+                    lock (_lock) { GoToLobby_Locked(); }
+                }) { IsBackground = true }.Start();
             }
             else
-            {
-                _round++;
-                RestartRound_Locked();
-            }
+                {
+                    _matchRound++;
+                    _round++;
+                    RestartRound_Locked();
+                }
         }
 
         void GoToLobby_Locked()
@@ -1023,6 +1052,9 @@ namespace DodgeServer
 
             // ● 리셋 전 기준으로 결정: 게임에 0명이면 0라운드, 아니면 1라운드 대기
             _round = (activeBeforeReset == 0) ? 0 : 1;
+            _matchRound = 1;          // ★ 매치 라운드 리셋
+            _totalScores.Clear();     // ★ 합계 리셋
+            _roundTallied = false;
 
             BroadcastLobby();
         }
@@ -1037,14 +1069,16 @@ namespace DodgeServer
             StringBuilder sb = new StringBuilder(4096);
             sb.Append("{\"cmd\":\"SNAPSHOT\",\"tick\":").Append(_tick).Append(",")
               .Append("\"round\":").Append(_round).Append(",")
-              // ★ phase 문자열 수정 (Lobby도 포함)
+              // ★ phase 문자열 (Lobby 포함)
               .Append("\"phase\":\"")
                  .Append(_phase == Phase.Playing ? "playing" :
                          _phase == Phase.AwaitingRestart ? "await" :
                          _phase == Phase.Countdown ? "countdown" : "lobby")
               .Append("\",")
               .Append("\"countdown_ms\":").Append(_countdownMsLeft).Append(",")
-              .Append("\"need_count\":").Append(activeCount).Append(",");   // ★ 변경
+              .Append("\"need_count\":").Append(activeCount).Append(",")
+              .Append("\"match_round\":").Append(_matchRound).Append(",")
+              .Append("\"match_total\":").Append(MatchTotal).Append(",");
 
             lock (_lock)
             {
@@ -1093,5 +1127,44 @@ namespace DodgeServer
             }
         }
 
-    }
+        // ★ match_over 전용 스냅샷(합계 포함)
+        void BroadcastMatchOver()
+        {
+            StringBuilder sb = new StringBuilder(4096);
+            sb.Append("{\"cmd\":\"SNAPSHOT\",")
+              .Append("\"tick\":").Append(_tick).Append(",")
+              .Append("\"round\":").Append(_round).Append(",")
+              .Append("\"phase\":\"match_over\",")
+              .Append("\"countdown_ms\":0,")
+              .Append("\"need_count\":").Append(ActivePlayerCount_Locked()).Append(",")
+              .Append("\"match_round\":").Append(_matchRound).Append(",")
+              .Append("\"match_total\":").Append(MatchTotal).Append(",");
+
+            lock (_lock)
+            {
+                // totals
+                sb.Append("\"totals\":[");
+                bool first = true;
+                foreach (var kv in _players)
+                {
+                    var p = kv.Value;
+                    if (!first) sb.Append(",");
+                    first = false;
+                    int tot = 0; _totalScores.TryGetValue(p.Id, out tot);
+                    sb.Append("{\"id\":\"").Append(p.Id).Append("\",")
+                      .Append("\"name\":\"").Append(Escape(p.Name)).Append("\",")
+                      .Append("\"total\":").Append(tot).Append("}");
+                }
+                sb.Append("]}");
+
+                string json = sb.ToString();
+                foreach (var kv in _players)
+                {
+                    var pl = kv.Value;
+                    if (pl.LeftToLobby) continue;
+                    try { Wire.SendJson(pl.Ns, json); } catch { }
+                }
+            }
+        }
+   }
 }

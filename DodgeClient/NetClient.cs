@@ -14,6 +14,9 @@ namespace DodgeBattleStarter
         public class NetPlayer { public string Id; public string Name; public float X, Y; public bool Alive; public int Score; }
         public class NetObstacle { public float X, Y, W, H; public int K; }
 
+        //NEW: match_over 합계용
+        public class NetTotal { public string Id; public string Name; public int Total; }
+
         public class NetSnapshot
         {
             public int Tick, Round;
@@ -21,6 +24,9 @@ namespace DodgeBattleStarter
             public int CountdownMs, VoteCount, NeedCount;
             public List<NetPlayer> Players = new List<NetPlayer>();
             public List<NetObstacle> Obstacles = new List<NetObstacle>();
+            public int MatchRound;                       // 서버: "match_round"
+            public int MatchTotal;                       // 서버: "match_total"
+            public List<NetTotal> Totals = new List<NetTotal>();  // 서버: "totals"
         }
 
         public class NetLobbyPlayer { public string Id; public string Name; public string Color; public bool Ready; }
@@ -216,6 +222,8 @@ namespace DodgeBattleStarter
             s.CountdownMs = ExtractInt(json, "countdown_ms");
             s.VoteCount = ExtractInt(json, "vote_count");
             s.NeedCount = ExtractInt(json, "need_count");
+            s.MatchRound = ExtractInt(json, "match_round");
+            s.MatchTotal = ExtractInt(json, "match_total");
 
             // players
             int pArrS = json.IndexOf("\"players\":[");
@@ -275,6 +283,32 @@ namespace DodgeBattleStarter
                     }
                 }
             }
+            int tArrS = json.IndexOf("\"totals\":[");
+            if (tArrS >= 0)
+            {
+                int tArrE = json.IndexOf("]", tArrS);
+                if (tArrE > tArrS)
+                {
+                    string arr = json.Substring(tArrS, tArrE - tArrS + 1);
+                    int idx = 0;
+                    while (true)
+                    {
+                        int idS = arr.IndexOf("\"id\":\"", idx);
+                        if (idS < 0) break;
+                        int idE = arr.IndexOf("\"", idS + 6);
+                        string id = arr.Substring(idS + 6, idE - (idS + 6));
+
+                        string name = ExtractStringAfter(arr, "\"name\":\"", idE);
+                        int total = ExtractIntAfter(arr, "\"total\":", idE);
+
+                        s.Totals.Add(new NetTotal { Id = id, Name = name, Total = total });
+
+                        int close = arr.IndexOf("}", idE);
+                        idx = (close >= 0 ? close : idE) + 1;
+                    }
+                }
+            }
+
             return s;
         }
 

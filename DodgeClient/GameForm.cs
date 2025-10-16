@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.Windows.Forms;
+using System.Xml.Linq;
 using static DodgeBattleStarter.NetClient;
 
 namespace DodgeBattleStarter
@@ -989,22 +990,22 @@ namespace DodgeBattleStarter
                             e.Graphics.DrawString(roundText, titleFont, Brushes.White, roundX, roundY);
 
                             // 2) 스코어보드
-                            var sorted = new List<NetPlayer>(snapForHud.Players);
-                            sorted.Sort(delegate (NetPlayer a, NetPlayer b)
+                            var scoresSorted = new List<NetPlayer>(snapForHud.Players);
+                            scoresSorted.Sort(delegate (NetPlayer a, NetPlayer b)
                             {
                                 int cmp = b.Score.CompareTo(a.Score);
                                 if (cmp != 0) return cmp;
                                 return string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase);
                             });
 
-                            int show = Math.Min(6, sorted.Count);
+                            int showScores = Math.Min(6, scoresSorted.Count);
                             float sbWidth = 220f;
                             float sbRowH = 15f;
                             float sbHeadH = 28f;
                             float sbX = ClientSize.Width - sbWidth - 12;
                             float sbY = 8f;
 
-                            RectangleF sbRect = new RectangleF(sbX, sbY, sbWidth, sbHeadH + show * sbRowH + 12);
+                            RectangleF sbRect = new RectangleF(sbX, sbY, sbWidth, sbHeadH + showScores * sbRowH + 12);
                             e.Graphics.FillRectangle(panelBg, sbRect);
 
                             e.Graphics.DrawString("SCORE BOARD", headFont, Brushes.White, sbX + 10, sbY + 6);
@@ -1015,9 +1016,9 @@ namespace DodgeBattleStarter
                             e.Graphics.DrawString("Score", smallFont, gray, colScoreX, sbY + sbHeadH + 2);
 
                             float rowStartY = sbY + sbHeadH + 16f;
-                            for (int i = 0; i < show; i++)
+                            for (int i = 0; i < showScores; i++)
                             {
-                                var p = sorted[i];
+                                var p = scoresSorted[i];
                                 float rowY = rowStartY + (i * sbRowH);
 
                                 Color bgColor =
@@ -1114,6 +1115,51 @@ namespace DodgeBattleStarter
                                     e.Graphics.DrawString(msg, big, Brushes.White,
                                         (ClientSize.Width - sz.Width) / 2f,
                                         (ClientSize.Height - sz.Height) / 2f);
+                                }
+                            }
+                            else if (snapForHud.Phase == "match_over")
+                            {
+                                using (var big = new Font("Segoe UI", 22, FontStyle.Bold))
+                                using (var head = new Font("Segoe UI", 12, FontStyle.Bold))
+                                using (var small = new Font("Segoe UI", 11))
+                                {
+                                    // 타이틀
+                                    string title = $"MATCH OVER  ({snapForHud.MatchRound}/{snapForHud.MatchTotal})";
+                                    SizeF tsz = e.Graphics.MeasureString(title, big);
+                                    float w = Math.Max(360, tsz.Width + 80);
+                                    float h = 160 + Math.Min(6, snapForHud.Totals.Count) * 22;
+                                    RectangleF box = new RectangleF((ClientSize.Width - w) / 2f, (ClientSize.Height - h) / 2f, w, h);
+                                    e.Graphics.FillRectangle(panelBg, box);
+                                    e.Graphics.DrawString(title, big, Brushes.White, box.X + 20, box.Y + 16);
+
+                                    // 합계 정렬
+                                    var totalsSorted = new List<NetTotal>(snapForHud.Totals);
+                                    totalsSorted.Sort((a, b) => b.Total.CompareTo(a.Total));
+                                    
+                                    float y = box.Y + 64;
+                                    e.Graphics.DrawString("Player", head, Brushes.Gainsboro, box.X + 24, y);
+                                    e.Graphics.DrawString("Total", head, Brushes.Gainsboro, box.Right - 90, y);
+                                    y += 26;
+
+                                    int showTotals = Math.Min(6, totalsSorted.Count);
+                                    for (int i = 0; i < showTotals; i++)
+                                    {
+                                        var t = totalsSorted[i];
+                                        string name = string.IsNullOrEmpty(t.Name) ? t.Id : t.Name;
+                                        if (name.Length > 16) name = name.Substring(0, 16) + "…";
+                                        // 색 칩
+                                        Color chip = (_colorById.TryGetValue(t.Id, out var c) ? c : Color.White);
+                                        using (var chipBr = new SolidBrush(chip))
+                                            e.Graphics.FillEllipse(chipBr, box.X + 24, y + 4, 10, 10);
+                                        e.Graphics.DrawString(name, small, Brushes.White, box.X + 40, y);
+                                        e.Graphics.DrawString(t.Total.ToString(), small, Brushes.White, box.Right - 90, y);
+                                        y += 22;
+                                    }
+                                    
+                                    // 안내
+                                    string hint = "Returning to Lobby… (or press R to start a new match)";
+                                    SizeF hsz = e.Graphics.MeasureString(hint, small);
+                                    e.Graphics.DrawString(hint, small, Brushes.Gainsboro, box.X + (w - hsz.Width) / 2f, box.Bottom - 28);
                                 }
                             }
                             else if (snapForHud.Phase == "playing")
