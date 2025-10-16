@@ -2,7 +2,6 @@
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
-using System.Reflection;  // 리플렉션으로 스냅샷 장애물 필드 접근
 using System.Windows.Forms;
 using static DodgeBattleStarter.NetClient;
 
@@ -71,7 +70,8 @@ namespace DodgeBattleStarter
 
         // GameForm 필드 추가
         long _lastLobbyTsServer = -1;
-        string _lastLobbySig = null;
+        string _lastLobbySig = null;   // 로비 스냅샷 중복 반영 방지용 시그니처
+        string _myColorHex;
 
         // ====== 오프라인용 ======
         class Player
@@ -113,7 +113,6 @@ namespace DodgeBattleStarter
 
         // Ready 전송 디바운스 & 최신 LOBBY 판별용
         DateTime _lastReadySend = DateTime.MinValue;
-        long _lastLobbyTs = -1;      // 서버가 LOBBY에 넣어주는 ts(없으면 그대로 -1 유지)
 
         public GameForm()
         {
@@ -126,7 +125,6 @@ namespace DodgeBattleStarter
 
             this.KeyPreview = true;  // ★ 폼이 키 입력을 먼저 받게 함 (중요)
 
-            KeyDown += OnKeyDown;
             KeyUp += OnKeyUp;
 
             TryConnectOnline();       // 온라인 접속 시도 (실패 시 오프라인)
@@ -275,21 +273,7 @@ namespace DodgeBattleStarter
             Label lb2 = new Label { Text = "Color", ForeColor = Color.White, AutoSize = true };
             _pColorPreview = new Panel { Width = 240, Height = 20, BackColor = ColorTranslator.FromHtml(_colorHtml) };
             _btnPickColor = new Button { Text = "Pick Color", Width = 240 };
-            _btnPickColor.Click += (s, e) =>
-            {
-                // ① 디바운스(중복 빠른 클릭 무시)
-                var now = DateTime.UtcNow;
-                if ((now - _lastReadySend).TotalMilliseconds < 120) return;
-                _lastReadySend = now;
-
-                // ② 낙관적 UI 토글(서버 확정 오면 다시 맞춰줌)
-                bool want = !_readyLocal;
-                _readyLocal = want;
-                _btnReady.Text = _readyLocal ? "UNREADY" : "READY";
-
-                if (_online && _net != null)
-                    _net.SendReady(want);
-            };
+            _btnPickColor.Click += OnPickColorClicked;
 
             _btnReady = new Button { Text = "READY", Width = 240, Height = 32 };
             _btnReady.Click += (s, e) =>
@@ -629,100 +613,6 @@ namespace DodgeBattleStarter
             float cx = r.X + r.Width / 2f;
             float cy = r.Y + r.Height / 2f;
             return new RectangleF(cx - newW / 2f, cy - newH / 2f, newW, newH);
-        }
-
-        // =============== 온라인 스냅샷 리플렉션 유틸 ===============
-        static float GetFloatMember(Type t, object o, string name, float defVal)
-        {
-            // 1) 딕셔너리 먼저
-            object dv;
-            if (TryGetFromDict(o, name, out dv))
-            {
-                try { return Convert.ToSingle(dv, System.Globalization.CultureInfo.InvariantCulture); } catch { }
-            }
-
-            // 2) 프로퍼티/필드 (대/소문자 모두 시도)
-            string[] names = { name, name.ToLowerInvariant() };
-            foreach (var nm in names)
-            {
-                var pi = t.GetProperty(nm, BindingFlags.Instance | BindingFlags.Public | BindingFlags.IgnoreCase);
-                if (pi != null)
-                {
-                    object v = pi.GetValue(o, null);
-                    if (v is IConvertible)
-                        try { return Convert.ToSingle(v, System.Globalization.CultureInfo.InvariantCulture); } catch { }
-                }
-                var fi = t.GetField(nm, BindingFlags.Instance | BindingFlags.Public | BindingFlags.IgnoreCase);
-                if (fi != null)
-                {
-                    object v = fi.GetValue(o);
-                    if (v is IConvertible)
-                        try { return Convert.ToSingle(v, System.Globalization.CultureInfo.InvariantCulture); } catch { }
-                }
-            }
-            return defVal;
-        }
-
-        static bool TryGetFromDict(object o, string key, out object val)
-        {
-            val = null;
-            // 비제네릭 IDictionary
-            var dict = o as System.Collections.IDictionary;
-            if (dict != null)
-            {
-                if (dict.Contains(key)) { val = dict[key]; return true; }
-                // 키 대소문자 변형도 시도
-                string lk = key.ToLowerInvariant(), uk = key.ToUpperInvariant();
-                foreach (var k in dict.Keys)
-                {
-                    if (k is string ks &&
-                        (ks == key || ks == lk || ks == uk))
-                    { val = dict[k]; return true; }
-                }
-                return false;
-            }
-
-            // 제네릭 IDictionary<string, object>
-            var gen = o as IDictionary<string, object>;
-            if (gen != null)
-            {
-                object tmp;
-                if (gen.TryGetValue(key, out tmp)) { val = tmp; return true; }
-                if (gen.TryGetValue(key.ToLowerInvariant(), out tmp)) { val = tmp; return true; }
-                if (gen.TryGetValue(key.ToUpperInvariant(), out tmp)) { val = tmp; return true; }
-            }
-            return false;
-        }
-
-        static int GetIntMember(Type t, object o, string name, int defVal)
-        {
-            // 1) 딕셔너리 먼저
-            object dv;
-            if (TryGetFromDict(o, name, out dv))
-            {
-                try { return Convert.ToInt32(dv, System.Globalization.CultureInfo.InvariantCulture); } catch { }
-            }
-
-            // 2) 프로퍼티/필드 (대/소문자 모두 시도)
-            string[] names = { name, name.ToLowerInvariant() };
-            foreach (var nm in names)
-            {
-                var pi = t.GetProperty(nm, BindingFlags.Instance | BindingFlags.Public | BindingFlags.IgnoreCase);
-                if (pi != null)
-                {
-                    object v = pi.GetValue(o, null);
-                    if (v is IConvertible)
-                        try { return Convert.ToInt32(v, System.Globalization.CultureInfo.InvariantCulture); } catch { }
-                }
-                var fi = t.GetField(nm, BindingFlags.Instance | BindingFlags.Public | BindingFlags.IgnoreCase);
-                if (fi != null)
-                {
-                    object v = fi.GetValue(o);
-                    if (v is IConvertible)
-                        try { return Convert.ToInt32(v, System.Globalization.CultureInfo.InvariantCulture); } catch { }
-                }
-            }
-            return defVal;
         }
 
         // =============== 경계/땅/스폰 ===============
@@ -1267,6 +1157,25 @@ namespace DodgeBattleStarter
             }
         }
 
+    // ===== Pick Color 처리 =====
+    void OnPickColorClicked(object sender, EventArgs e)
+    {
+        using (var dlg = new ColorDialog())
+        {
+            dlg.FullOpen = true;
+            dlg.Color = _pColorPreview.BackColor;
+            if (dlg.ShowDialog(this) == DialogResult.OK)
+            {
+            _pColorPreview.BackColor = dlg.Color;
+                            // #RRGGBB 형식으로 전송
+            string hex = $"#{dlg.Color.R:X2}{dlg.Color.G:X2}{dlg.Color.B:X2}";
+            _net?.SendSetColor(hex);
+                            // 선택적으로, UI에 즉시 반영될 수 있도록 로컬 캐시 색도 업데이트
+            _myColorHex = hex; // (필드가 없으면 string _myColorHex; 하나 추가해도 OK)
+                        }
+        }
+    }
+
         protected override void Dispose(bool disposing)
         {
             if (disposing)
@@ -1295,12 +1204,6 @@ namespace DodgeBattleStarter
                 }
             }
             base.Dispose(disposing);
-        }
-
-        void DrawPlayer(Graphics g, Player p)
-        {
-            using (var br = new SolidBrush(p.Alive ? p.Color : Color.Gray))
-                g.FillRectangle(br, Rectangle.Round(p.Rect));
         }
 
         // ── 오프라인 테스트용 봇 ──

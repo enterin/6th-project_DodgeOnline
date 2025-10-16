@@ -919,13 +919,6 @@ namespace DodgeServer
             return value;
         }
 
-        static int Clamp(int value, int min, int max)
-        {
-            if (value < min) return min;
-            if (value > max) return max;
-            return value;
-        }
-
         // 3-1) 공통 JSON 생성기
         string BuildLobbyJson_Locked()
         {
