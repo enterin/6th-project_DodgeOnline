@@ -1015,7 +1015,7 @@ namespace DodgeServer
                 // 4초 보여준 뒤 로비 이동
                 new Thread(() =>
                 {
-                    Thread.Sleep(4000);
+                    Thread.Sleep(10000);
                     lock (_lock) { GoToLobby_Locked(); }
                 }) { IsBackground = true }.Start();
             }
@@ -1062,21 +1062,28 @@ namespace DodgeServer
 
         void BroadcastSnapshot()
         {
-            // ★ LeftToLobby 제외한 활성 인원 계산
+            // ★ LeftToLobby 제외한 활성 인원
             int activeCount = 0;
             foreach (var kv in _players) if (!kv.Value.LeftToLobby) activeCount++;
 
             StringBuilder sb = new StringBuilder(4096);
-            sb.Append("{\"cmd\":\"SNAPSHOT\",\"tick\":").Append(_tick).Append(",")
+            sb.Append("{\"cmd\":\"SNAPSHOT\",")
+              .Append("\"tick\":").Append(_tick).Append(",")
               .Append("\"round\":").Append(_round).Append(",")
-              // ★ phase 문자열 (Lobby 포함)
               .Append("\"phase\":\"")
                  .Append(_phase == Phase.Playing ? "playing" :
                          _phase == Phase.AwaitingRestart ? "await" :
                          _phase == Phase.Countdown ? "countdown" : "lobby")
               .Append("\",")
+
+              // countdown 남은 시간
               .Append("\"countdown_ms\":").Append(_countdownMsLeft).Append(",")
+
+              // ★ 투표/필요 인원 수
+              .Append("\"vote_count\":").Append(_respawnVotes.Count).Append(",")
               .Append("\"need_count\":").Append(activeCount).Append(",")
+
+              // 매치 라운드 정보 (클라 HUD에서 사용)
               .Append("\"match_round\":").Append(_matchRound).Append(",")
               .Append("\"match_total\":").Append(MatchTotal).Append(",");
 
@@ -1088,7 +1095,7 @@ namespace DodgeServer
                 foreach (var kv in _players)
                 {
                     var p = kv.Value;
-                    if (p.LeftToLobby) continue;   // ★ 개인 로비로 빠진 유저는 스냅샷에서 제외
+                    if (p.LeftToLobby) continue;
                     if (!first) sb.Append(",");
                     first = false;
                     sb.Append("{\"id\":\"").Append(p.Id).Append("\",")
@@ -1100,7 +1107,7 @@ namespace DodgeServer
                 }
                 sb.Append("],");
 
-                // obstacles (x,y,w,h,k)
+                // obstacles
                 sb.Append("\"obstacles\":[");
                 for (int i = 0; i < _obstacles.Count; i++)
                 {
@@ -1113,16 +1120,37 @@ namespace DodgeServer
                       .Append(",\"k\":").Append((int)o.Kind)
                       .Append("}");
                 }
-                sb.Append("]}");
+                sb.Append("]");
+
+                // ★ ROUND OVER(=await)일 때, 합계 totals도 함께 넣어주기
+                if (_phase == Phase.AwaitingRestart)
+                {
+                    sb.Append(",\"totals\":[");
+                    bool firstTot = true;
+                    foreach (var kv in _players)
+                    {
+                        var p = kv.Value;
+                        // 개인 로비로 빠진 유저는 합계에서 빼고 싶으면 아래 continue
+                        // if (p.LeftToLobby) continue;
+
+                        if (!firstTot) sb.Append(",");
+                        firstTot = false;
+                        int tot = 0; _totalScores.TryGetValue(p.Id, out tot);
+                        sb.Append("{\"id\":\"").Append(p.Id).Append("\",")
+                          .Append("\"name\":\"").Append(Escape(p.Name)).Append("\",")
+                          .Append("\"total\":").Append(tot).Append("}");
+                    }
+                    sb.Append("]");
+                }
+
+                sb.Append("}");
 
                 string json = sb.ToString();
-
                 foreach (var kv in _players)
                 {
                     var pl = kv.Value;
-                    if (pl.LeftToLobby) continue;      // ★ 개인 로비 유저에게는 스냅샷 보내지 않음
-                    try { Wire.SendJson(pl.Ns, json); }
-                    catch { /* ... */ }
+                    if (pl.LeftToLobby) continue;   // 개인 로비 유저에겐 스냅샷 미전송
+                    try { Wire.SendJson(pl.Ns, json); } catch { }
                 }
             }
         }

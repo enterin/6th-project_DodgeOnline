@@ -1107,59 +1107,63 @@ namespace DodgeBattleStarter
                                     string msg = string.Format("ROUND OVER - Press R to restart  ({0}/{1})",
                                                                snapForHud.VoteCount, snapForHud.NeedCount);
                                     SizeF sz = e.Graphics.MeasureString(msg, big);
+
+                                    // 중앙에 ROUND OVER 패널
                                     RectangleF midPanel = new RectangleF(
                                         (ClientSize.Width - sz.Width) / 2f - 16,
                                         (ClientSize.Height - sz.Height) / 2f - 10,
                                         sz.Width + 32, sz.Height + 20);
+
                                     e.Graphics.FillRectangle(panelBg, midPanel);
                                     e.Graphics.DrawString(msg, big, Brushes.White,
                                         (ClientSize.Width - sz.Width) / 2f,
                                         (ClientSize.Height - sz.Height) / 2f);
-                                }
-                            }
-                            else if (snapForHud.Phase == "match_over")
-                            {
-                                using (var big = new Font("Segoe UI", 22, FontStyle.Bold))
-                                using (var head = new Font("Segoe UI", 12, FontStyle.Bold))
-                                using (var small = new Font("Segoe UI", 11))
-                                {
-                                    // 타이틀
-                                    string title = $"MATCH OVER  ({snapForHud.MatchRound}/{snapForHud.MatchTotal})";
-                                    SizeF tsz = e.Graphics.MeasureString(title, big);
-                                    float w = Math.Max(360, tsz.Width + 80);
-                                    float h = 160 + Math.Min(6, snapForHud.Totals.Count) * 22;
-                                    RectangleF box = new RectangleF((ClientSize.Width - w) / 2f, (ClientSize.Height - h) / 2f, w, h);
-                                    e.Graphics.FillRectangle(panelBg, box);
-                                    e.Graphics.DrawString(title, big, Brushes.White, box.X + 20, box.Y + 16);
 
-                                    // 합계 정렬
-                                    var totalsSorted = new List<NetTotal>(snapForHud.Totals);
-                                    totalsSorted.Sort((a, b) => b.Total.CompareTo(a.Total));
-                                    
-                                    float y = box.Y + 64;
-                                    e.Graphics.DrawString("Player", head, Brushes.Gainsboro, box.X + 24, y);
-                                    e.Graphics.DrawString("Total", head, Brushes.Gainsboro, box.Right - 90, y);
-                                    y += 26;
-
-                                    int showTotals = Math.Min(6, totalsSorted.Count);
-                                    for (int i = 0; i < showTotals; i++)
+                                    // ▼ 바로 아래에 매치 합계 전광판 같이 표시(있을 때만)
+                                    if (snapForHud.MatchTotal > 0 && snapForHud.Totals != null && snapForHud.Totals.Count > 0)
                                     {
-                                        var t = totalsSorted[i];
-                                        string name = string.IsNullOrEmpty(t.Name) ? t.Id : t.Name;
-                                        if (name.Length > 16) name = name.Substring(0, 16) + "…";
-                                        // 색 칩
-                                        Color chip = (_colorById.TryGetValue(t.Id, out var c) ? c : Color.White);
-                                        using (var chipBr = new SolidBrush(chip))
-                                            e.Graphics.FillEllipse(chipBr, box.X + 24, y + 4, 10, 10);
-                                        e.Graphics.DrawString(name, small, Brushes.White, box.X + 40, y);
-                                        e.Graphics.DrawString(t.Total.ToString(), small, Brushes.White, box.Right - 90, y);
-                                        y += 22;
+                                        using (var panelBg2 = new SolidBrush(Color.FromArgb(180, 0, 0, 0)))
+                                        using (var big2 = new Font("Segoe UI", 20, FontStyle.Bold))
+                                        using (var head2 = new Font("Segoe UI", 12, FontStyle.Bold))
+                                        using (var small2 = new Font("Segoe UI", 11))
+                                        {
+                                            // ROUND OVER 박스 바로 아래로 붙이기
+                                            float offsetY = midPanel.Bottom + 14f;
+
+                                            string title = $"MATCH TOTAL SCORE  ({snapForHud.MatchRound}/{snapForHud.MatchTotal})";
+                                            SizeF tsz = e.Graphics.MeasureString(title, big2);
+                                            float w = Math.Max(360, tsz.Width + 80);
+                                            float h = 140 + Math.Min(6, snapForHud.Totals.Count) * 22;
+                                            RectangleF box = new RectangleF((ClientSize.Width - w) / 2f, offsetY, w, h);
+
+                                            e.Graphics.FillRectangle(panelBg2, box);
+                                            e.Graphics.DrawString(title, big2, Brushes.White, box.X + 20, box.Y + 16);
+
+                                            var totalsSorted = new List<NetTotal>(snapForHud.Totals);
+                                            totalsSorted.Sort((a, b) => b.Total.CompareTo(a.Total));
+
+                                            float y = box.Y + 64;
+                                            e.Graphics.DrawString("Player", head2, Brushes.Gainsboro, box.X + 24, y);
+                                            e.Graphics.DrawString("Total", head2, Brushes.Gainsboro, box.Right - 90, y);
+                                            y += 26;
+
+                                            int rows = Math.Min(6, totalsSorted.Count);
+                                            for (int i = 0; i < rows; i++)
+                                            {
+                                                var t = totalsSorted[i];
+                                                string name = string.IsNullOrEmpty(t.Name) ? t.Id : t.Name;
+                                                if (name.Length > 16) name = name.Substring(0, 16) + "…";
+
+                                                Color chip = (_colorById.TryGetValue(t.Id, out var c) ? c : Color.White);
+                                                using (var chipBr = new SolidBrush(chip))
+                                                    e.Graphics.FillEllipse(chipBr, box.X + 24, y + 4, 10, 10);
+
+                                                e.Graphics.DrawString(name, small2, Brushes.White, box.X + 40, y);
+                                                e.Graphics.DrawString(t.Total.ToString(), small2, Brushes.White, box.Right - 90, y);
+                                                y += 22;
+                                            }
+                                        }
                                     }
-                                    
-                                    // 안내
-                                    string hint = "Returning to Lobby… (or press R to start a new match)";
-                                    SizeF hsz = e.Graphics.MeasureString(hint, small);
-                                    e.Graphics.DrawString(hint, small, Brushes.Gainsboro, box.X + (w - hsz.Width) / 2f, box.Bottom - 28);
                                 }
                             }
                             else if (snapForHud.Phase == "playing")
