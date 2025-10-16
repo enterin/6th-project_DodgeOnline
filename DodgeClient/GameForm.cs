@@ -69,6 +69,10 @@ namespace DodgeBattleStarter
         private bool _readyLocal = false;
         private string _colorHtml = "#39A9F9";
 
+        // GameForm 필드 추가
+        long _lastLobbyTsServer = -1;
+        string _lastLobbySig = null;
+
         // ====== 오프라인용 ======
         class Player
         {
@@ -90,7 +94,7 @@ namespace DodgeBattleStarter
         // ====== 온라인 모드 ======
         NetClient _net;
         bool _online = false;
-        string _serverHost = "10.10.21.123";
+        string _serverHost = "127.0.0.1";
         int _serverPort = 5055;
         string _nickname = "player1";
 
@@ -386,6 +390,20 @@ namespace DodgeBattleStarter
             if (_lvLobby.Parent != null) _lvLobby.Parent.BringToFront();
         }
 
+        // 간단 서명 만들기: 인원수/레디수/각 플레이어 id+ready 묶어서 문자열
+        string MakeLobbySignature(NetLobby lb)
+        {
+            if (lb == null || lb.Players == null) return "";
+            var sb = new System.Text.StringBuilder();
+            sb.Append(lb.Need).Append('|').Append(lb.Ready).Append('|');
+            for (int i = 0; i < lb.Players.Count; i++)
+            {
+                var p = lb.Players[i];
+                sb.Append(p.Id).Append(':').Append(p.Ready ? '1' : '0').Append('|');
+            }
+            return sb.ToString();
+        }
+
         // 내 Ready 상태와 버튼 텍스트를 동시에 맞추는 헬퍼
         void SetMyReady(bool v)
         {
@@ -448,44 +466,50 @@ namespace DodgeBattleStarter
                 acc -= step;
             }
 
+            // GameForm.TickFrame()의 로비 처리 부분 교체
             if (_online && _net != null)
             {
-                // ── 1) 서버 LOBBY 수신 시: 즉시 로비 화면으로 전환하고 종료 ──
                 NetLobby lb = _net.TryGetLobby();
                 if (lb != null)
                 {
-                    UpdateLobbyUI(lb);
+                    // ① 변경 여부 판단 (ts 또는 signature가 달라질 때만)
+                    string sig = MakeLobbySignature(lb);
+                    bool changed = (lb.Ts != _lastLobbyTsServer) || (sig != _lastLobbySig);
 
-                    // 내 READY 상태는 서버 기준으로만 동기화
-                    bool myReady = false;
-                    if (lb.Players != null && _net != null)
+                    if (changed)
                     {
-                        foreach (var pl in lb.Players)
-                            if (pl.Id == _net.MyId) { myReady = pl.Ready; break; }
-                    }
-                    if (myReady != _readyLocal)
-                    {
-                        _readyLocal = myReady;
-                        if (_btnReady != null) _btnReady.Text = _readyLocal ? "UNREADY" : "READY";
+                        _lastLobbyTsServer = lb.Ts;
+                        _lastLobbySig = sig;
+
+                        UpdateLobbyUI(lb);
+
+                        // 내 Ready 버튼 동기화 (서버 기준)
+                        bool myReady = false;
+                        if (lb.Players != null && _net != null)
+                            foreach (var pl in lb.Players)
+                                if (pl.Id == _net.MyId) { myReady = pl.Ready; break; }
+                        if (myReady != _readyLocal)
+                        {
+                            _readyLocal = myReady;
+                            if (_btnReady != null) _btnReady.Text = _readyLocal ? "UNREADY" : "READY";
+                        }
+
+                        // 게임 캐시 클리어(로비 진입 시 1회만)
+                        _obsOnline.Clear();
+                        _playersOnline.Clear();
+                        _aliveOnline.Clear();
+                        _scoreOnline.Clear();
+
+                        Invalidate(); // 변경이 있을 때만 다시 그리기
                     }
 
-                    // 게임 캐시 클리어(로비 잔상 방지)
-                    _obsOnline.Clear();
-                    _playersOnline.Clear();
-                    _aliveOnline.Clear();
-                    _scoreOnline.Clear();
-
-                    Invalidate();
-                    return; // ★ 이번 프레임은 로비 전용
+                    return; // 로비 프레임 종료
                 }
 
-                // ── 2) 로비가 아니면 패널 숨김 ──
-                UpdateLobbyUI(null);
-
-                // (선택) 여기서 스냅샷을 확인해도 되고,
-                // 이미 Step()에서 온라인이면 스냅샷 파싱만 하고 리턴하므로 생략 가능
-                // var snap = _net.TryGetSnapshot(); // 필요시 사용
+                // 로비가 아니라면 UI 숨김 (한 번만)
+                if (_pLobby.Visible) UpdateLobbyUI(null);
             }
+
 
             Invalidate();
         }

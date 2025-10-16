@@ -75,24 +75,6 @@ namespace DodgeBattleStarter
             }
         }
 
-        // ★ LOBBY 수신 플래그/버퍼
-        volatile bool _hasLobby;
-        string _lobbyJson;
-
-        // ★ GameForm에서 한 번만 소비
-        public bool TryConsumeLobby(out string json)
-        {
-            if (_hasLobby)
-            {
-                json = _lobbyJson;
-                _lobbyJson = null;
-                _hasLobby = false;
-                return true;
-            }
-            json = null;
-            return false;
-        }
-
         public void Close()
         {
             _running = false;
@@ -203,11 +185,6 @@ namespace DodgeBattleStarter
                     {
                         NetLobby lb = ParseLobby(json);
                         lock (_lobbyLock) _lobbyLatest = lb;
-                    }
-                    else if (json.IndexOf("\"cmd\":\"LOBBY\"") >= 0)  // ★ 로비 패킷 수신
-                    {
-                        _lobbyJson = json;
-                        _hasLobby = true;
                     }
                     // (그 외 cmd는 현재 없음)
                 }
@@ -334,8 +311,8 @@ namespace DodgeBattleStarter
                     }
                 }
             }
-            lb.Ts = Environment.TickCount;  // ★ 지금 받은 로비의 도착 시각 기록
-
+            // ★ 수정: 서버에서 보낸 ts 사용 (기존: Environment.TickCount)
+            lb.Ts = ExtractInt(json, "ts");
             return lb;
         }
 

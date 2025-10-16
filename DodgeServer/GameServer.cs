@@ -948,8 +948,6 @@ namespace DodgeServer
                   .Append("}");
             }
             sb.Append("],\"need_count\":").Append(need)
-              .Append(",\"ready_count\":").Append(ready).Append("}");
-            sb.Append("],\"need_count\":").Append(need)
             .Append(",\"ready_count\":").Append(ready)
             .Append(",\"ts\":").Append((int)_sw.ElapsedMilliseconds)   // ★ 추가: 최신성 판별용
             .Append("}");
