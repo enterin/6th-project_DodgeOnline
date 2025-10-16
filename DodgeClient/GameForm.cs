@@ -1104,22 +1104,27 @@ namespace DodgeBattleStarter
                             {
                                 using (var big = new Font("Segoe UI", 18, FontStyle.Bold))
                                 {
+                                    // ① ROUND OVER 문구 표시
                                     string msg = string.Format("ROUND OVER - Press R to restart  ({0}/{1})",
                                                                snapForHud.VoteCount, snapForHud.NeedCount);
                                     SizeF sz = e.Graphics.MeasureString(msg, big);
 
-                                    // 중앙에 ROUND OVER 패널
+                                    // ★ 여기서 전체 위치를 제어 (0.28f = 상단 약 28% 높이)
+                                    float textX = (ClientSize.Width - sz.Width) / 2f;
+                                    float textY = ClientSize.Height * 0.28f;
+
+                                    // 패널 배경 (ROUND OVER)
                                     RectangleF midPanel = new RectangleF(
-                                        (ClientSize.Width - sz.Width) / 2f - 16,
-                                        (ClientSize.Height - sz.Height) / 2f - 10,
-                                        sz.Width + 32, sz.Height + 20);
-
+                                        textX - 16,
+                                        textY - 10,
+                                        sz.Width + 32,
+                                        sz.Height + 20);
                                     e.Graphics.FillRectangle(panelBg, midPanel);
-                                    e.Graphics.DrawString(msg, big, Brushes.White,
-                                        (ClientSize.Width - sz.Width) / 2f,
-                                        (ClientSize.Height - sz.Height) / 2f);
 
-                                    // ▼ 바로 아래에 매치 합계 전광판 같이 표시(있을 때만)
+                                    // 문구
+                                    e.Graphics.DrawString(msg, big, Brushes.White, textX, textY);
+
+                                    // ② 전광판 (ROUND OVER 박스 아래에)
                                     if (snapForHud.MatchTotal > 0 && snapForHud.Totals != null && snapForHud.Totals.Count > 0)
                                     {
                                         using (var panelBg2 = new SolidBrush(Color.FromArgb(180, 0, 0, 0)))
@@ -1127,8 +1132,7 @@ namespace DodgeBattleStarter
                                         using (var head2 = new Font("Segoe UI", 12, FontStyle.Bold))
                                         using (var small2 = new Font("Segoe UI", 11))
                                         {
-                                            // ROUND OVER 박스 바로 아래로 붙이기
-                                            float offsetY = midPanel.Bottom + 14f;
+                                            float offsetY = midPanel.Bottom + 20f; // ← ROUND OVER 바로 아래로
 
                                             string title = $"MATCH TOTAL SCORE  ({snapForHud.MatchRound}/{snapForHud.MatchTotal})";
                                             SizeF tsz = e.Graphics.MeasureString(title, big2);
@@ -1166,6 +1170,7 @@ namespace DodgeBattleStarter
                                     }
                                 }
                             }
+
                             else if (snapForHud.Phase == "playing")
                             {
                                 using (var big = new Font("Segoe UI", 12, FontStyle.Bold))

@@ -1015,7 +1015,7 @@ namespace DodgeServer
                 // 4초 보여준 뒤 로비 이동
                 new Thread(() =>
                 {
-                    Thread.Sleep(10000);
+                    Thread.Sleep(4000);
                     lock (_lock) { GoToLobby_Locked(); }
                 }) { IsBackground = true }.Start();
             }
