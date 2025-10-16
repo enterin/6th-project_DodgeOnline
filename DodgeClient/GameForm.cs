@@ -23,6 +23,7 @@ namespace DodgeBattleStarter
         // 스프라이트(방향별)
         Image _imgPlayerRightRaw, _imgPlayerLeftRaw;
         Image _imgPlayerRight, _imgPlayerLeft;
+        Dictionary<string, Color> _colorById = new Dictionary<string, Color>();
 
         // 장애물 스프라이트
         Image _imgFire_SwordRaw, _imgFire_Sword;
@@ -545,6 +546,13 @@ namespace DodgeBattleStarter
                         if (pl.Alive) _aliveOnline.Add(pl.Id);
                         _scoreOnline[pl.Id] = pl.Score;
                     }
+
+                    if (_net != null && _myColorHex != null)
+                    {
+                        var meId = _net.MyId;
+                        if (!_colorById.ContainsKey(meId))
+                            _colorById[meId] = ColorTranslator.FromHtml(_myColorHex);
+                    }
                 }
                 return; // 온라인은 서버 스냅샷만 렌더
             }
@@ -719,16 +727,26 @@ namespace DodgeBattleStarter
         }
 
         // =============== 플레이어 렌더 ===============
-        void DrawPlayerSprite(Graphics g, RectangleF rect, bool alive, bool highlight, bool facingRight)
+        void DrawPlayerSprite(Graphics g, RectangleF rect, bool alive, bool highlight, bool facingRight, Color? accent = null)
         {
             var r = Rectangle.Round(rect);
             Image img = facingRight ? _imgPlayerRight : _imgPlayerLeft;
 
-            // 본체
-            if (img != null) g.DrawImage(img, r);
+            if (img != null)
+            {
+                if (accent.HasValue)
+                {
+                    // 틴트 적용 함수 사용
+                    DrawTintedImage(g, img, r, accent.Value);
+                }
+                else
+                {
+                    g.DrawImage(img, r);
+                }
+            }
             else
             {
-                using (var br = new SolidBrush(alive ? Color.DeepSkyBlue : Color.Gray))
+                using (var br = new SolidBrush(accent ?? (alive ? Color.DeepSkyBlue : Color.Gray)))
                     g.FillRectangle(br, r);
             }
 
@@ -921,16 +939,22 @@ namespace DodgeBattleStarter
                         continue;
                     }
 
-                    DrawPlayerSprite(e.Graphics, rect, alive, highlight: false, facingRight: faceRight);
+                    Color? accent = null;
+                    if (_colorById.TryGetValue(id, out var c)) accent = c;
+                    DrawPlayerSprite(e.Graphics, rect, alive, highlight: false, facingRight: faceRight, accent);
+
                 }
 
                 // ★ 마지막에 내 캐릭터를 최상단으로 강조 그리기
                 if (myRectForLater.HasValue)
                 {
+                    Color? myAccent = null;
+                    if (_colorById.TryGetValue(_net.MyId, out var meC)) myAccent = meC;
                     DrawPlayerSprite(e.Graphics, myRectForLater.Value,
                                      _aliveOnline.Contains(_net.MyId),
-                                     highlight: _strongHighlight,         // 토글 반영
-                                     facingRight: _facingRight);
+                                     highlight: _strongHighlight,
+                                     facingRight: _facingRight,
+                                     accent: myAccent);
                 }
 
                 // ---- 상단 작은 텍스트 + 라운드/스코어보드/HUD ----
@@ -1038,12 +1062,23 @@ namespace DodgeBattleStarter
                                 float nameX = badgeX + badgeW + namePad;
                                 float scoreX = colScoreX;
 
-                                using (rowBrush)
+                                Color rowColor = Color.White;
+                                if (_colorById.TryGetValue(p.Id, out var picked))
+                                    rowColor = picked;
+
                                 using (var textFont = new Font("Segoe UI", 10, me ? FontStyle.Bold : FontStyle.Regular))
+                                using (var nameBrush = new SolidBrush(rowColor))
+                                using (var scoreBrush = new SolidBrush(me ? Color.LightSkyBlue : (p.Alive ? Color.White : Color.Gray)))
                                 {
-                                    e.Graphics.DrawString(name, textFont, rowBrush, nameX, rowY);
-                                    e.Graphics.DrawString(p.Score.ToString(), textFont, rowBrush, scoreX, rowY);
+                                    // 색 칩(원) 표시
+                                    float chipR = 5f;
+                                    e.Graphics.FillEllipse(nameBrush, nameX - 12 - chipR, rowY + 4, chipR * 2, chipR * 2);
+
+                                    // 이름/점수
+                                    e.Graphics.DrawString(name, textFont, nameBrush, nameX, rowY);
+                                    e.Graphics.DrawString(p.Score.ToString(), textFont, scoreBrush, scoreX, rowY);
                                 }
+
                             }
 
                             // 3) 중앙 오버레이(카운트다운/투표)
@@ -1172,7 +1207,9 @@ namespace DodgeBattleStarter
             _net?.SendSetColor(hex);
                             // 선택적으로, UI에 즉시 반영될 수 있도록 로컬 캐시 색도 업데이트
             _myColorHex = hex; // (필드가 없으면 string _myColorHex; 하나 추가해도 OK)
-                        }
+
+            _colorById[_net?.MyId ?? "local"] = dlg.Color;   // 내 색 기억
+                }
         }
     }
 
@@ -1276,5 +1313,26 @@ namespace DodgeBattleStarter
             }
             return false;
         }
+
+        static void DrawTintedImage(Graphics g, Image img, Rectangle dest, Color tint)
+        {
+            if (img == null) return;
+
+            float tr = tint.R / 255f, tg = tint.G / 255f, tb = tint.B / 255f;
+
+            var cm = new System.Drawing.Imaging.ColorMatrix(new float[][]
+            {
+                new float[] { tr, 0,  0,  0, 0 },
+                new float[] { 0,  tg, 0,  0, 0 },
+                new float[] { 0,  0,  tb, 0, 0 },
+                new float[] { 0,  0,  0,  1, 0 },
+                new float[] { 0,  0,  0,  0, 1 },
+            });
+
+            var ia = new System.Drawing.Imaging.ImageAttributes();
+            ia.SetColorMatrix(cm, System.Drawing.Imaging.ColorMatrixFlag.Default, System.Drawing.Imaging.ColorAdjustType.Bitmap);
+            g.DrawImage(img, dest, 0, 0, img.Width, img.Height, GraphicsUnit.Pixel, ia);
+        }
+
     }
 }
